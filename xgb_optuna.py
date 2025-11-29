@@ -361,7 +361,6 @@ train_df, test_df = split_by_person_stratified(
     user_id_col="user_id",
     label_col="label",
     train_person_ratio=0.8,  # 按人 8:2
-    max_per_day=5,
     train_per_class=1000,
     test_per_class=300,
     seed=42,
@@ -479,6 +478,7 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
 
 
 
