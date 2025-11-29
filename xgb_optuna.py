@@ -182,9 +182,11 @@ def sample_user_by_day(df_user: pd.DataFrame,
 def load_one_user_file(path: str) -> pd.DataFrame:
     df_prv  = pd.read_excel(path, sheet_name="feature_prv")
     df_time = pd.read_excel(path, sheet_name="feature_time")
-    df_welch = pd.read_excel(path, sheet_name="feature_welch")
+    df_welch1 = pd.read_excel(path, sheet_name="feature_welch1")
+    df_welch2 = pd.read_excel(path, sheet_name="feature_welch2")
     df_ref  = pd.read_excel(path, sheet_name="reference_time")
-    df_freq = pd.read_excel(path, sheet_name="feature_frequency")
+    df_freq1 = pd.read_excel(path, sheet_name="feature_frequency1")
+    df_freq2 = pd.read_excel(path, sheet_name="feature_frequency2")
 
     def smart_merge(left, right):
         cand_keys = [
@@ -198,9 +200,11 @@ def load_one_user_file(path: str) -> pd.DataFrame:
 
     base = df_prv
     base = smart_merge(base, df_time)
-    base = smart_merge(base, df_welch)
+    base = smart_merge(base, df_welch1)
+    base = smart_merge(base, df_welch2)
     base = smart_merge(base, df_ref)
-    base = smart_merge(base, df_freq)
+    base = smart_merge(base, df_freq1)
+    base = smart_merge(base, df_freq2)
 
     # 把 "[a,b]" 列拆成 col_x/col_y
     # base = expand_bracket_features(base)
@@ -475,5 +479,6 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
 
 
