@@ -68,52 +68,12 @@ def expand_bracket_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f"{col}_y"] = two_cols[1]
     return df
 
-"""
-# 构造新特征
-def generate_new_features(df: pd.DataFrame) -> pd.DataFrame:
-    ancient_data = df.drop(columns=["feature_name"], errors='ignore')
-    data = ancient_data.select_dtypes(include=[np.number])
-    new_features = pd.DataFrame(index=data.index)
-
-    new_features["row_std"] = data.std(axis=1)
-    new_features["row_min"] = data.min(axis=1)
-    new_features["row_max"] = data.max(axis=1)
-
-    if "FDA1x" in data.columns and "FDA1y" in data.columns:
-        new_features["fda1_slope"] = data["FDA1y"] / (data["FDA1x"] + 1e-6)
-    if "FDB1x" in data.columns and "FDB1y" in data.columns:
-        new_features["fdb1_slope"] = data["FDB1y"] / (data["FDB1x"] + 1e-6)
-
-    if set(["HR", "PRT"]).issubset(data.columns):
-        new_features["delta_hr_prt"] = data["HR"] - data["PRT"]
-        new_features["hr_prt_ratio"] = data["HR"] / (data["PRT"] + 1e-6)
-        new_features["log_hr_diff"] = np.log1p(np.abs(data["HR"] - data["PRT"]))
-
-    if set(["VF1", "VF2", "VF3", "VF4", "VF5"]).issubset(data.columns):
-        new_features["sum_vf"] = data[["VF1", "VF2", "VF3", "VF4", "VF5"]].sum(axis=1)
-        for k in ["VF1", "VF2", "VF3", "VF4", "VF5"]:
-            new_features[k.lower() + "_ratio"] = data[k] / (new_features["sum_vf"] + 1e-6)
-
-    # c*/s* 的比例特征
-    if set(["c0", "c1", "c2", "c3", "c4", "c5"]).issubset(data.columns):
-        new_features["sum_c"] = data[[f"c{i}" for i in range(6)]].sum(axis=1)
-        for i in range(6):
-            new_features[f"c{i}_ratio"] = data[f"c{i}"] / (new_features["sum_c"] + 1e-6)
-
-    if set(["s0", "s1", "s2", "s3", "s4", "s5"]).issubset(data.columns):
-        new_features["sum_s"] = data[[f"s{i}" for i in range(6)]].sum(axis=1)
-        for i in range(6):
-            new_features[f"s{i}_ratio"] = data[f"s{i}"] / (new_features["sum_s"] + 1e-6)
-
-    return pd.concat([data, new_features], axis=1)
-
-"""    
-
 def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
     """
     针对新的 5-sheet 特征表：
     - 去掉所有不参与训练的标识列
     - 删除所有 "[a,b]" 的原始字符串列（FDA1、frequency_lobe*、ppg_peak...）
+    - 进一步按列名规则删掉冗余特征（Welch、峰谷坐标等）
     - 只保留数值特征 + label
     """
 
@@ -130,8 +90,16 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
         "data_len",
     ]
 
+    # 额外识别列（你在那段 drop_cols 里写的那些）
+    id_like_cols = ["user_id", "data_name", "cycle_number",
+                    "select_number", "total_select_number", "_date_for_limit"]
+
     def _process(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
+
+        # 0. 必须先保证有 label
+        if "label" not in df.columns:
+            raise ValueError("数据中没有 label 列，请确认在调用 deal_file 前已经打好标签。")
 
         # 1. 删掉各种非特征列
         df = df.drop(
@@ -139,21 +107,40 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
             errors="ignore"
         )
 
-        # 2. 删掉所有 "[a,b]" 的原始字符串列
+        # 2. 删掉所有 "[a,b]" 的原始字符串列（BRACKET_FEATURE_COLS 你之前已经定义了）
         df = df.drop(
             columns=[c for c in BRACKET_FEATURE_COLS if c in df.columns],
             errors="ignore"
         )
 
-        # 3. 只保留数值特征 + label
-        if "label" not in df.columns:
-            raise ValueError("数据中没有 label 列，请确认在调用 deal_file 前已经打好标签。")
-
+        # ====== 这里开始是你那段 drop_cols 逻辑，整合进来 ======
         label = df["label"]
         feature_df = df.drop(columns=["label"])
 
-        # 只保留数值型特征列
+        drop_cols = []
+
+        # 2.1 删除 Welch 的所有列（spectrum*, frequency_lobe*）
+        drop_cols += [c for c in feature_df.columns
+                      if c.startswith("spectrum") or c.startswith("frequency_lobe")]
+
+        # 2.2 删除坐标类峰谷信息（peak/valley 字样的列）
+        drop_cols += [c for c in feature_df.columns
+                      if "peak" in c.lower() or "valley" in c.lower()]
+
+        # 2.3 删除识别列/日期辅助列
+        drop_cols += [c for c in id_like_cols if c in feature_df.columns]
+
+        # 2.4 删除仍为字符串/对象类型的列（label 已经单独拿出来了）
+        drop_cols += [c for c in feature_df.columns
+                      if feature_df[c].dtype == "object"]
+
+        # 真正删除
+        feature_df = feature_df.drop(columns=list(set(drop_cols)), errors="ignore")
+
+        # 2.5 再保险：只保留数值型特征列（防止还有残留的非数值）
         feature_df = feature_df.select_dtypes(include=[np.number])
+
+        print(f"处理后保留特征数：{feature_df.shape[1]}")
 
         # 拼回 label
         df_processed = pd.concat([feature_df, label], axis=1)
@@ -165,6 +152,31 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
     return train_df, test_df
 
+
+def sample_user_by_day(df_user: pd.DataFrame,
+                       max_per_day: int = 20,
+                       seed: int = 42) -> pd.DataFrame:
+    """
+    对单个用户的数据按“日期”分组，每个(人, 日期)最多保留 max_per_day 条记录。
+    日期从 data_name 末尾的 YYYYMMDDhhmmss 中解析出来。
+    """
+    df_user = df_user.copy()
+
+    if "data_name" in df_user.columns:
+        # 提取 data_name 里的 YYYYMMDD，形如 ..._20240603013426
+        ts_str = df_user["data_name"].astype(str).str.extract(r"_(\d{8})\d{6}$", expand=False)
+        dates = pd.to_datetime(ts_str, format="%Y%m%d", errors="coerce")
+        df_user["_date_for_limit"] = dates.dt.strftime("%Y-%m-%d")
+    else:
+        # 没有 data_name，就只能当成一个“虚拟日期”
+        df_user["_date_for_limit"] = "NA"
+
+    # 按 (user_id, 日期) 分组，每组最多 max_per_day 条
+    return (
+        df_user.groupby(["user_id", "_date_for_limit"], group_keys=False)
+               .apply(lambda g: g.sample(n=min(len(g), max_per_day), random_state=seed))
+               .reset_index(drop=True)
+    )
 
 
 def load_one_user_file(path: str) -> pd.DataFrame:
@@ -200,18 +212,15 @@ def split_by_person_stratified(
     user_id_col: str = "user_id",
     label_col: str = "label",
     train_person_ratio: float = 0.8,
-    max_per_day: int = 20,          # 👈 改成每人每天最多多少条
     train_per_class: int = 1000,
     test_per_class: int = 300,
     seed: int = 42,
 ):
     """
-    按人划分 + 每人每天最多 max_per_day 条 + 每类固定样本数（1000 / 300）
-    1. 按 user_id 随机划分 train/test 人群
-    2. 各自内部，每个(人, 日期)最多保留 max_per_day 条记录
-    3. 然后在 train/test 内部分别按 label 分层抽样
+    版本2：假设“按天抽样”已经在读取阶段完成，这里只负责：
+      1. 按人划分 train/test（人不交叉）
+      2. 在各自内部按 label 分层抽样：train 每类≤train_per_class，test 每类≤test_per_class
     """
-
     rng = np.random.RandomState(seed)
     df = df.copy()
     df[user_id_col] = df[user_id_col].astype(str)
@@ -229,35 +238,7 @@ def split_by_person_stratified(
     train_raw = df[df[user_id_col].isin(train_ids)].copy()
     test_raw  = df[df[user_id_col].isin(test_ids)].copy()
 
-    # === 第二步：每人每天最多 max_per_day 条 ===
-    def limit_per_person_per_day(d: pd.DataFrame) -> pd.DataFrame:
-        if d.empty:
-            return d
-
-        d = d.copy()
-
-        # 如果有 data_name，就从 data_name 中解析日期（到“天”）
-        if "data_name" in d.columns:
-            # 形如 "..._20240603013426" -> 取出 "20240603"
-            ts_str = d["data_name"].astype(str).str.extract(r"_(\d{8})\d{6}$", expand=False)
-            dates = pd.to_datetime(ts_str, format="%Y%m%d", errors="coerce")
-            d["_date_for_limit"] = dates.dt.strftime("%Y-%m-%d")
-            group_cols = [user_id_col, "_date_for_limit"]
-        else:
-            # 没有 data_name 就退化为“按人限样本数”
-            d["_date_for_limit"] = "NA"
-            group_cols = [user_id_col, "_date_for_limit"]
-
-        return (
-            d.groupby(group_cols, group_keys=False)
-             .apply(lambda g: g.sample(n=min(len(g), max_per_day), random_state=seed))
-             .reset_index(drop=True)
-        )
-
-    train_limited = limit_per_person_per_day(train_raw)
-    test_limited  = limit_per_person_per_day(test_raw)
-
-    # === 第三步：按 label 分层抽样 ===
+    # === 第二步：按 label 分层抽样（不再按天/按人限一次） ===
     def stratified_sample(d: pd.DataFrame, per_class: int) -> pd.DataFrame:
         parts = []
         for label, g in d.groupby(label_col):
@@ -271,10 +252,10 @@ def split_by_person_stratified(
         else:
             return d.iloc[0:0].copy()
 
-    train_final = stratified_sample(train_limited, train_per_class)
-    test_final  = stratified_sample(test_limited, test_per_class)
+    train_final = stratified_sample(train_raw, train_per_class)
+    test_final  = stratified_sample(test_raw, test_per_class)
 
-    print("=== 划分结果统计 ===")
+    print("=== 划分结果统计（按人 + 按类） ===")
     print("训练集人数:", train_final[user_id_col].nunique(), "样本数:", len(train_final))
     print("训练集各类样本数:\n", train_final[label_col].value_counts().sort_index())
     print("测试集人数:", test_final[user_id_col].nunique(), "样本数:", len(test_final))
@@ -283,13 +264,12 @@ def split_by_person_stratified(
     return train_final, test_final
 
 
+
 # ———— 主流程 ————
 import glob
 
-MAX_ROWS_PER_USER = 50
-
 # === 路径配置 ===
-feature_dir = r"D:/2025_Stage/Code/XGB/ppgfeature"   # 特征文件夹
+feature_dir = r"D:/2025_Stage/Code/XGB/ppgfeature_v114"   # 特征文件夹
 user_info_path = r"D:/2025_Stage/Code/XGB/用户列表.csv"  # 里面有“年龄”那一列
 
 # 年龄 -> 年龄段标签
@@ -325,6 +305,8 @@ for f in glob.glob(os.path.join(feature_dir, "*.xlsx")) + \
         continue  # 排除 Excel 临时文件
     feature_files.append(f)
 
+MAX_PER_DAY_READ = 5
+
 for path in tqdm(feature_files, desc="正在加载用户特征数据"):
     # 文件名就是 user_id
     user_id_from_name = os.path.splitext(os.path.basename(path))[0]
@@ -358,8 +340,7 @@ for path in tqdm(feature_files, desc="正在加载用户特征数据"):
     label = age_to_group(age)   
 
     df["label"] = label
-    #if len(df) > MAX_ROWS_PER_USER:
-     #   df = df.sample(n=MAX_ROWS_PER_USER, random_state=42)
+    df = sample_user_by_day(df, max_per_day=MAX_PER_DAY_READ, seed=42)
 
     all_df.append(df)
 
@@ -494,4 +475,5 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
 
