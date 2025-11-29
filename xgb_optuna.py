@@ -195,89 +195,23 @@ def load_one_user_file(path: str) -> pd.DataFrame:
 
     return base
 
-
-
-# ———— 数据拆分策略：split_by_person_random ————
-from sklearn.utils import resample
-
-def split_by_person_random(df: pd.DataFrame,
-                           train_sample_limit: int = 1000,
-                           test_sample_limit: int = 300,
-                           max_per_person: int = 30,
-                           train_ratio: float = 0.8,
-                           seed: int = 42,
-                           verbose: bool = True):
-    """
-    针对新数据：
-    - 一行 = 一次测量
-    - user_id = 用户ID
-    - 按 user_id 划分训练 / 测试，不同用户不会交叉
-    """
-    np.random.seed(seed)
-    df = df.copy()
-
-    if "user_id" not in df.columns:
-        raise ValueError("数据里没有 user_id 列，无法按人划分！")
-
-    # 用user_id 当 group_id
-    df["group_id"] = df["user_id"].astype(str)
-
-    # 用“每个用户”为一个 group
-    df["person_day"] = df["group_id"]
-
-    # 按人划分 train / test
-    unique_people = df["group_id"].unique()
-    np.random.shuffle(unique_people)
-    split_idx = int(len(unique_people) * train_ratio)
-    train_people = unique_people[:split_idx]
-    test_people  = unique_people[split_idx:]
-
-    train_raw = df[df["group_id"].isin(train_people)]
-    test_raw  = df[df["group_id"].isin(test_people)]
-
-    # 每人最多保留 max_per_person 条样本
-    def limit_by_person(df_raw):
-        return df_raw.groupby("person_day", group_keys=False).apply(
-            lambda g: g.sample(n=min(len(g), max_per_person), random_state=seed)
-        ).reset_index(drop=True)
-
-    train_df = limit_by_person(train_raw)
-    test_df  = limit_by_person(test_raw)
-
-    # 控制总样本量
-    def limit_sample_count(df_raw, max_samples):
-        if len(df_raw) <= max_samples:
-            return df_raw
-        else:
-            return df_raw.sample(n=max_samples, random_state=seed)
-
-    train_df = limit_sample_count(train_df, train_sample_limit)
-    test_df  = limit_sample_count(test_df,  test_sample_limit)
-
-    if verbose:
-        print(f"训练集人数: {train_df['group_id'].nunique()}, 样本数: {len(train_df)}")
-        print(f"测试集人数: {test_df['group_id'].nunique()}, 样本数: {len(test_df)}")
-
-    return train_df, test_df
-
 def split_by_person_stratified(
     df: pd.DataFrame,
     user_id_col: str = "user_id",
     label_col: str = "label",
     train_person_ratio: float = 0.8,
-    max_per_person: int = 30,
+    max_per_day: int = 20,          # 👈 改成每人每天最多多少条
     train_per_class: int = 1000,
     test_per_class: int = 300,
     seed: int = 42,
 ):
     """
-    按人划分 + 每人最多 max_per_person 条 + 每类固定样本数（1000 / 300）
+    按人划分 + 每人每天最多 max_per_day 条 + 每类固定样本数（1000 / 300）
     1. 按 user_id 随机划分 train/test 人群
-    2. 各自内部，每人最多保留 max_per_person 条记录
-    3. 然后在 train/test 内部分别按 label 分层抽样：
-        - 训练集：每个 label 最多 train_per_class 条
-        - 测试集：每个 label 最多 test_per_class 条
+    2. 各自内部，每个(人, 日期)最多保留 max_per_day 条记录
+    3. 然后在 train/test 内部分别按 label 分层抽样
     """
+
     rng = np.random.RandomState(seed)
     df = df.copy()
     df[user_id_col] = df[user_id_col].astype(str)
@@ -295,18 +229,33 @@ def split_by_person_stratified(
     train_raw = df[df[user_id_col].isin(train_ids)].copy()
     test_raw  = df[df[user_id_col].isin(test_ids)].copy()
 
-    # === 第二步：每人最多 max_per_person 条 ===
-    def limit_per_person(d: pd.DataFrame) -> pd.DataFrame:
+    # === 第二步：每人每天最多 max_per_day 条 ===
+    def limit_per_person_per_day(d: pd.DataFrame) -> pd.DataFrame:
         if d.empty:
             return d
+
+        d = d.copy()
+
+        # 如果有 data_name，就从 data_name 中解析日期（到“天”）
+        if "data_name" in d.columns:
+            # 形如 "..._20240603013426" -> 取出 "20240603"
+            ts_str = d["data_name"].astype(str).str.extract(r"_(\d{8})\d{6}$", expand=False)
+            dates = pd.to_datetime(ts_str, format="%Y%m%d", errors="coerce")
+            d["_date_for_limit"] = dates.dt.strftime("%Y-%m-%d")
+            group_cols = [user_id_col, "_date_for_limit"]
+        else:
+            # 没有 data_name 就退化为“按人限样本数”
+            d["_date_for_limit"] = "NA"
+            group_cols = [user_id_col, "_date_for_limit"]
+
         return (
-            d.groupby(user_id_col, group_keys=False)
-             .apply(lambda g: g.sample(n=min(len(g), max_per_person), random_state=seed))
+            d.groupby(group_cols, group_keys=False)
+             .apply(lambda g: g.sample(n=min(len(g), max_per_day), random_state=seed))
              .reset_index(drop=True)
         )
 
-    train_limited = limit_per_person(train_raw)
-    test_limited  = limit_per_person(test_raw)
+    train_limited = limit_per_person_per_day(train_raw)
+    test_limited  = limit_per_person_per_day(test_raw)
 
     # === 第三步：按 label 分层抽样 ===
     def stratified_sample(d: pd.DataFrame, per_class: int) -> pd.DataFrame:
@@ -409,8 +358,8 @@ for path in tqdm(feature_files, desc="正在加载用户特征数据"):
     label = age_to_group(age)   
 
     df["label"] = label
-    if len(df) > MAX_ROWS_PER_USER:
-        df = df.sample(n=MAX_ROWS_PER_USER, random_state=42)
+    #if len(df) > MAX_ROWS_PER_USER:
+     #   df = df.sample(n=MAX_ROWS_PER_USER, random_state=42)
 
     all_df.append(df)
 
@@ -427,7 +376,7 @@ train_df, test_df = split_by_person_stratified(
     user_id_col="user_id",
     label_col="label",
     train_person_ratio=0.8,  # 按人 8:2
-    max_per_person=30,
+    max_per_day=5,
     train_per_class=1000,
     test_per_class=300,
     seed=42,
@@ -545,3 +494,4 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
