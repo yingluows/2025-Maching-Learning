@@ -70,14 +70,12 @@ def expand_bracket_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
     """
-    针对新的 5-sheet 特征表：
-    - 去掉所有不参与训练的标识列
-    - 删除所有 "[a,b]" 的原始字符串列（FDA1、frequency_lobe*、ppg_peak...）
-    - 进一步按列名规则删掉冗余特征（Welch、峰谷坐标等）
-    - 只保留数值特征 + label
+    - 去掉各种非特征列
+    - 使用 BRACKET_FEATURE_COLS 的 *_x, *_y 构造一个新特征 col_mag = sqrt(x^2 + y^2)
+    - 然后删掉原始字符串列 + *_x, *_y
+    - 最终只保留数值特征 + label
     """
 
-    # 各个 sheet 里不参与训练的“标识/索引类”列
     drop_not_features = [
         "user_id",
         "data_name",
@@ -90,67 +88,55 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
         "data_len",
     ]
 
-    # 额外识别列（你在那段 drop_cols 里写的那些）
-    id_like_cols = ["user_id", "data_name", "cycle_number",
-                    "select_number", "total_select_number", "_date_for_limit"]
-
     def _process(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        # 0. 必须先保证有 label
         if "label" not in df.columns:
             raise ValueError("数据中没有 label 列，请确认在调用 deal_file 前已经打好标签。")
 
-        # 1. 删掉各种非特征列
+        # 1. 先删各种非特征列
         df = df.drop(
             columns=[c for c in drop_not_features if c in df.columns],
             errors="ignore"
         )
 
-        # 2. 删掉所有 "[a,b]" 的原始字符串列（BRACKET_FEATURE_COLS 你之前已经定义了）
+        # 2. 用 *_x, *_y 构造合成特征 col_mag
+        #    比如 FDA1_x, FDA1_y -> FDA1_mag
+        for col in BRACKET_FEATURE_COLS:
+            cx = f"{col}_x"
+            cy = f"{col}_y"
+            if cx in df.columns and cy in df.columns:
+                df[f"{col}_mag"] = np.sqrt(df[cx] ** 2 + df[cy] ** 2)
+
+        # 3. 删掉原始 "[a,b]" 字符串列
         df = df.drop(
             columns=[c for c in BRACKET_FEATURE_COLS if c in df.columns],
             errors="ignore"
         )
 
-        # ====== drop_cols ======
+        # 4. 拆 label / feature_df
         label = df["label"]
         feature_df = df.drop(columns=["label"])
 
-        drop_cols = []
+        # 5. 删掉所有 *_x, *_y，只保留刚刚造出来的 *_mag
+        feature_df = feature_df.drop(
+            columns=[c for c in feature_df.columns if c.endswith("_x") or c.endswith("_y")],
+            errors="ignore"
+        )
 
-        # 2.1 删除 Welch 的所有列（spectrum*, frequency_lobe*）
-        #drop_cols += [c for c in feature_df.columns
-                      #if c.startswith("spectrum") or c.startswith("frequency_lobe")]
-
-        # 2.2 删除坐标类峰谷信息（peak/valley 字样的列）
-        #drop_cols += [c for c in feature_df.columns
-                      #if "peak" in c.lower() or "valley" in c.lower()]
-
-        # 2.3 删除识别列/日期辅助列
-        drop_cols += [c for c in id_like_cols if c in feature_df.columns]
-
-        # 2.4 删除仍为字符串/对象类型的列（label 已经单独拿出来了）
-        drop_cols += [c for c in feature_df.columns
-                      if feature_df[c].dtype == "object"]
-
-        # 真正删除
-        feature_df = feature_df.drop(columns=list(set(drop_cols)), errors="ignore")
-
-        # 2.5 再保险：只保留数值型特征列（防止还有残留的非数值）
+        # 6. 再删所有 object 列（保险）
         feature_df = feature_df.select_dtypes(include=[np.number])
 
-        print(f"处理后保留特征数：{feature_df.shape[1]}")
+        print(f"[deal_file] 处理后保留特征数：{feature_df.shape[1]}")
 
-        # 拼回 label
         df_processed = pd.concat([feature_df, label], axis=1)
-
         return df_processed
 
     train_df = _process(train_df)
     test_df = _process(test_df)
 
     return train_df, test_df
+
 
 
 def sample_user_by_day(df_user: pd.DataFrame,
@@ -478,6 +464,28 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
+# === 导出全部 SHAP 特征重要性排名 ===
+
+# 获取特征重要性数组：每列对应一个特征
+shap_importance = np.abs(shap_values.values).mean(axis=0)
+
+# 构建 DataFrame 排序（全部特征）
+importance_all = pd.DataFrame({
+    "feature": sample_X.columns,
+    "importance": shap_importance
+}).sort_values(by="importance", ascending=False)
+
+# 控制台展示前几十个，方便快速查看
+print("\n=== 特征排名（显示前 20 个） ===")
+print(importance_all.head(20))
+
+# 保存到 CSV 文件
+save_importance_csv = r"D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_feature_importance.csv"
+importance_all.to_csv(save_importance_csv, index=False, encoding="utf-8-sig")
+
+print(f"所有特征重要性排名已保存到：{save_importance_csv}")
+
 
 
 
