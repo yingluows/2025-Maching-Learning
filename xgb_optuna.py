@@ -113,19 +113,19 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
             errors="ignore"
         )
 
-        # ====== 这里开始是你那段 drop_cols 逻辑，整合进来 ======
+        # ====== drop_cols ======
         label = df["label"]
         feature_df = df.drop(columns=["label"])
 
         drop_cols = []
 
         # 2.1 删除 Welch 的所有列（spectrum*, frequency_lobe*）
-        drop_cols += [c for c in feature_df.columns
-                      if c.startswith("spectrum") or c.startswith("frequency_lobe")]
+        #drop_cols += [c for c in feature_df.columns
+                      #if c.startswith("spectrum") or c.startswith("frequency_lobe")]
 
         # 2.2 删除坐标类峰谷信息（peak/valley 字样的列）
-        drop_cols += [c for c in feature_df.columns
-                      if "peak" in c.lower() or "valley" in c.lower()]
+        #drop_cols += [c for c in feature_df.columns
+                      #if "peak" in c.lower() or "valley" in c.lower()]
 
         # 2.3 删除识别列/日期辅助列
         drop_cols += [c for c in id_like_cols if c in feature_df.columns]
@@ -478,6 +478,7 @@ plt.savefig("D:\\2025_Stage\\Code\\XGB\\Save_fig\\xgb_shap_summary_bar.png", dpi
 plt.close()
 
 print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+
 
 
 
