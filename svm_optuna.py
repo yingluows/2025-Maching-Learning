@@ -124,6 +124,18 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
         drop_cols = []
 
+        # 2.1 删除 Welch 的所有列（spectrum*, frequency_lobe*）
+        #drop_cols += [c for c in feature_df.columns
+                      #if c.startswith("spectrum") or c.startswith("frequency_lobe")]
+
+        # 2.2 删除坐标类峰谷信息（peak/valley 字样的列）
+        #drop_cols += [c for c in feature_df.columns
+                      #if "peak" in c.lower() or "valley" in c.lower()]
+
+        # 2.3 删除识别列/日期辅助列
+        drop_cols += [c for c in id_like_cols if c in feature_df.columns]
+
+        
         # 2.4 删除仍为字符串/对象类型的列（label 已经单独拿出来了）
         drop_cols += [c for c in feature_df.columns
                       if feature_df[c].dtype == "object"]
