@@ -30,8 +30,8 @@ SAVE_MODEL_DIR = os.path.join(BASE_DIR, "Save_model")
 os.makedirs(SAVE_FIG_DIR, exist_ok=True)
 os.makedirs(SAVE_MODEL_DIR, exist_ok=True)
 
-TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_feat.csv")
-TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_feat.csv")
+TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v1.csv")
+TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v1.csv")
 
 
 # ========= 数据读取 =========
@@ -205,3 +205,4 @@ if __name__ == "__main__":
 
     # 调参 + 训练 + 评估
     train_and_evaluate(X_train, X_test, y_train, y_test)
+
