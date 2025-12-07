@@ -1,155 +1,58 @@
 # main.py
 import os
-import glob
-
+import joblib
+import numpy as np
+import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
-import numpy as np
 import optuna
-import pandas as pd
-import joblib
-from tqdm import tqdm
+import shap
 
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import classification_report, ConfusionMatrixDisplay
-
 from xgboost import XGBClassifier
-import shap
 
-from deal_data import load_one_user_file, expand_bracket_features, deal_file
-from split import split_by_person_stratified
-
-# 设置中文字体
+# 中文字体设置（按需修改）
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
-matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
+matplotlib.rcParams['axes.unicode_minus'] = False
 
-# === 超参数 ===
-MAX_ROWS_PER_USER = 50  # 每个用户最多保留多少行（读取阶段限流）
+# ========= 路径配置 =========
+BASE_DIR = r"D:/2025_Stage/Code/XGB"
 
-# === 路径配置 ===
-feature_dir = r"D:/2025_Stage/Code/XGB/ppgfeature"          # 特征文件夹
-user_info_path = r"D:/2025_Stage/Code/XGB/用户列表.csv"       # 里面有“年龄”那一列
-SAVE_FIG_DIR = r"D:/2025_Stage/Code/XGB/Save_fig"
-SAVE_MODEL_DIR = r"D:/2025_Stage/Code/XGB/Save_model"
+DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
+SAVE_FIG_DIR = os.path.join(BASE_DIR, "Save_fig")
+SAVE_MODEL_DIR = os.path.join(BASE_DIR, "Save_model")
 
 os.makedirs(SAVE_FIG_DIR, exist_ok=True)
 os.makedirs(SAVE_MODEL_DIR, exist_ok=True)
 
-
-# 年龄 -> 年龄段标签
-def age_to_group(age: int) -> int:
-    if age < 20:
-        return 0
-    elif age < 30:
-        return 1
-    elif age < 40:
-        return 2
-    elif age < 50:
-        return 3
-    elif age < 60:
-        return 4
-    else:
-        return 5
+TRAIN_CSV_PATH = os.path.join(DATA_SPLIT_DIR, "train.csv")
+TEST_CSV_PATH = os.path.join(DATA_SPLIT_DIR, "test.csv")
 
 
-def load_all_data() -> pd.DataFrame:
-    """读取所有用户文件 + 打上年龄标签 + 展开 [a,b] 特征"""
-    # 读用户列表
-    user_info = pd.read_csv(user_info_path)
-    user_info["user_id"] = user_info["user_id"].astype(str)
-    user_info["user_id"] = user_info["user_id"].str.lstrip("_")  # 去掉前缀 "_"
-
-    all_df = []
-
-    # 同时支持 csv / xlsx 两种
-    feature_files = []
-    for f in glob.glob(os.path.join(feature_dir, "*.xlsx")) + \
-            glob.glob(os.path.join(feature_dir, "*.csv")):
-        name = os.path.basename(f)
-        if name.startswith("~$"):
-            continue  # 排除 Excel 临时文件
-        feature_files.append(f)
-
-    for path in tqdm(feature_files, desc="正在加载用户特征数据"):
-        # 文件名就是 user_id
-        user_id_from_name = os.path.splitext(os.path.basename(path))[0]
-
-        # 读特征
-        if path.lower().endswith(".csv"):
-            df = pd.read_csv(path)
-        elif path.lower().endswith(".xlsx"):
-            df = load_one_user_file(path)
-        else:
-            continue
-
-        # 确保有 user_id 列
-        if "user_id" in df.columns:
-            df["user_id"] = df["user_id"].astype(str)
-            user_id_in_file = str(df["user_id"].iloc[0])
-            if user_id_in_file != user_id_from_name:
-                print(f"⚠ 文件 {path} 文件名={user_id_from_name} 和内容里的 user_id={user_id_in_file} 不一致，以内容为准")
-                user_id_from_name = user_id_in_file
-        else:
-            df["user_id"] = user_id_from_name
-
-        # 在用户列表里查年龄
-        row = user_info[user_info["user_id"] == user_id_from_name]
-        if row.empty:
-            print(f"⚠ 在用户列表中找不到 user_id={user_id_from_name}，跳过这个文件")
-            continue
-
-        age = int(row["年龄"].iloc[0])
-        label = age_to_group(age)
-
-        df["label"] = label
-
-        # 每个用户先限流，避免单个文件太大
-        if len(df) > MAX_ROWS_PER_USER:
-            df = df.sample(n=MAX_ROWS_PER_USER, random_state=42)
-
-        all_df.append(df)
-
-    # 合并所有用户
-    df_all = pd.concat(all_df, ignore_index=True)
-    df_all = expand_bracket_features(df_all)
-
-    print("全部数据形状：", df_all.shape)
-    print("用户数量：", df_all["user_id"].nunique())
-
-    return df_all
-
-
-def train_and_explain():
-    # 1. 加载数据
-    df_all = load_all_data()
-
-    # 2. 按人划分 + 每类 1000/300 样本
-    train_df, test_df = split_by_person_stratified(
-        df_all,
-        user_id_col="user_id",
-        label_col="label",
-        train_person_ratio=0.8,  # 按人 8:2
-        max_per_person=30,
-        train_per_class=1000,
-        test_per_class=300,
-        seed=42,
-    )
-
-    # 3. 特征清理
-    train_df, test_df = deal_file(train_df, test_df)
+def load_data(train_path: str = TRAIN_CSV_PATH,
+              test_path: str = TEST_CSV_PATH):
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
 
     X_train = train_df.drop(columns=["label"])
     y_train = train_df["label"]
     X_test = test_df.drop(columns=["label"])
     y_test = test_df["label"]
 
-    # 4. 训练前清理无穷值为 NaN
+    # 替换 inf 为 NaN
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
     X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
-    # 5. Optuna 调参 —— 针对 XGBClassifier
+    print("训练集形状：", X_train.shape)
+    print("测试集形状：", X_test.shape)
+
+    return X_train, X_test, y_train, y_test
+
+
+def create_objective(X_train, y_train):
     def objective(trial):
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 100, 500),
@@ -176,15 +79,21 @@ def train_and_explain():
             ("xgb", xgb)
         ])
 
-        return cross_val_score(pipeline, X_train, y_train, cv=5, scoring="accuracy").mean()
+        score = cross_val_score(pipeline, X_train, y_train, cv=5, scoring="accuracy").mean()
+        return score
 
+    return objective
+
+
+def train_and_evaluate(X_train, X_test, y_train, y_test):
+    # Optuna 调参
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=30)
+    study.optimize(create_objective(X_train, y_train), n_trials=30)
 
     print("最优参数：", study.best_params)
     print("最优交叉验证准确率：", study.best_value)
 
-    # 6. 用最优参数重新训练
+    # 使用最优参数训练模型
     best_params = study.best_params.copy()
     xgb_best = XGBClassifier(
         objective="multi:softprob",
@@ -202,47 +111,78 @@ def train_and_explain():
     pipeline.fit(X_train, y_train)
     y_pred = pipeline.predict(X_test)
 
+    # 分类报告
     report_dict = classification_report(y_test, y_pred, output_dict=True)
     df_report = pd.DataFrame(report_dict).T
-    df_report.to_csv("D:/2025_Stage/Code/XGB/Save_fig/classification_report.csv", encoding="utf-8-sig")
-    print("分类报告已保存到: classification_report.csv")
-    
-    # 7. 混淆矩阵
+    report_path = os.path.join(SAVE_FIG_DIR, "classification_report.csv")
+    df_report.to_csv(report_path, encoding="utf-8-sig")
+    print(f"分类报告已保存到: {report_path}")
+
+    # 混淆矩阵
     ConfusionMatrixDisplay.from_estimator(
         pipeline, X_test, y_test,
         display_labels=sorted(y_train.unique()),
         cmap=plt.cm.Oranges
     )
     plt.title("XGB Confusion matrix")
+    cm_path = os.path.join(SAVE_FIG_DIR, "xgb_confusion_matrix_optuna.png")
+    plt.savefig(cm_path, dpi=300)
     plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_FIG_DIR, "xgb_confusion_matrix_optuna.png"), dpi=300)
     plt.show()
+    print(f"混淆矩阵已保存到: {cm_path}")
 
-    # 8. 保存模型
+    # 保存模型
     model_path = os.path.join(SAVE_MODEL_DIR, "xgb_model.pkl")
     joblib.dump(pipeline, model_path)
-    print(f"模型已保存到 {model_path}")
+    print(f"模型已保存到: {model_path}")
 
-    # 9. SHAP 解释
+    # SHAP 模型解释（可选）
+    run_shap(pipeline, X_test)
+
+    return pipeline
+
+
+def run_shap(pipeline, X_test: pd.DataFrame):
+    # 取部分样本
     sample_X = X_test.sample(n=min(200, len(X_test)), random_state=42)
 
     explainer = shap.Explainer(pipeline.predict, sample_X)
     shap_values = explainer(sample_X)
 
+    # SHAP summary dot
     plt.figure()
     shap.summary_plot(shap_values, sample_X, show=False)
     plt.title("XGB SHAP Summary (Dot)")
-    plt.savefig(os.path.join(SAVE_FIG_DIR, "xgb_shap_summary_dot.png"), dpi=300, bbox_inches='tight')
+    shap_dot_path = os.path.join(SAVE_FIG_DIR, "xgb_shap_summary_dot.png")
+    plt.savefig(shap_dot_path, dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"SHAP dot 图已保存到: {shap_dot_path}")
 
+    # SHAP bar
     plt.figure()
     shap.summary_plot(shap_values, sample_X, plot_type="bar", show=False)
     plt.title("XGB SHAP Summary (Bar)")
-    plt.savefig(os.path.join(SAVE_FIG_DIR, "xgb_shap_summary_bar.png"), dpi=300, bbox_inches='tight')
+    shap_bar_path = os.path.join(SAVE_FIG_DIR, "xgb_shap_summary_bar.png")
+    plt.savefig(shap_bar_path, dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"SHAP bar 图已保存到: {shap_bar_path}")
 
-    print("SHAP 解释图已保存：xgb_shap_summary_dot.png 与 xgb_shap_summary_bar.png")
+    # 导出全部特征重要性
+    shap_importance = np.abs(shap_values.values).mean(axis=0)
+    importance_all = pd.DataFrame({
+        "feature": sample_X.columns,
+        "importance": shap_importance
+    }).sort_values(by="importance", ascending=False)
+
+    print("\n=== 特征排名（显示前 20 个） ===")
+    print(importance_all.head(20))
+
+    importance_csv_path = os.path.join(SAVE_FIG_DIR, "xgb_shap_feature_importance.csv")
+    importance_all.to_csv(importance_csv_path, index=False, encoding="utf-8-sig")
+    print(f"所有特征重要性排名已保存到：{importance_csv_path}")
 
 
 if __name__ == "__main__":
-    train_and_explain()
+    X_train, X_test, y_train, y_test = load_data()
+    train_and_evaluate(X_train, X_test, y_train, y_test)
+
