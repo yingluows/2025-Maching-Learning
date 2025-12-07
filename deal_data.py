@@ -16,8 +16,8 @@ USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户列表.csv"
 OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test.csv")
+TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw.csv")
+TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw.csv")
 
 # 每人每天最多读取的样本数（按 data_name 中的日期）
 MAX_PER_DAY_READ = 5
@@ -200,3 +200,4 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
