@@ -9,13 +9,16 @@ import pandas as pd
 import shap
 import joblib
 
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import classification_report, ConfusionMatrixDisplay
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
+
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import RandomOverSampler
+
 
 
 # ========= Matplotlib 中文设置 =========
@@ -93,10 +96,12 @@ def create_objective(model_name: str, X_train, y_train):
                 **params,
             )
 
-            pipeline = Pipeline([
+            pipeline = ImbPipeline([
                 ("imputer", SimpleImputer(strategy="mean")),
+                ("upsample", RandomOverSampler(sampling_strategy=0.8, random_state=42)),
                 ("clf", clf),
             ])
+
 
         elif model_name == "svm":
             # SVM 对尺度敏感：必须标准化
@@ -117,11 +122,13 @@ def create_objective(model_name: str, X_train, y_train):
                 **params,
             )
 
-            pipeline = Pipeline([
+            pipeline = ImbPipeline(steps=[
                 ("imputer", SimpleImputer(strategy="mean")),
-                ("scaler", StandardScaler()),
+                ("scaler", StandardScaler()),                 # SVM 必须标准化
+                ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
                 ("clf", clf),
             ])
+
         else:
             raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
@@ -157,10 +164,13 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
             random_state=42,
             **best_params,
         )
-        pipeline = Pipeline([
+        pipeline = ImbPipeline([
             ("imputer", SimpleImputer(strategy="mean")),
+            ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
             ("clf", clf_best),
         ])
+
+
 
     elif model_name == "svm":
         clf_best = SVC(
@@ -169,11 +179,13 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
             random_state=42,
             **best_params,
         )
-        pipeline = Pipeline([
+        pipeline = ImbPipeline(steps=[
             ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", StandardScaler()),
+            ("scaler", StandardScaler()),                 # SVM 必须标准化
+            ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
             ("clf", clf_best),
         ])
+
     else:
         raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
@@ -305,3 +317,4 @@ if __name__ == "__main__":
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
     )
+
