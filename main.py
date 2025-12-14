@@ -17,7 +17,7 @@ from sklearn.svm import SVC
 from xgboost import XGBClassifier
 
 from imblearn.over_sampling import SMOTE
-from imblearn.over_sampling import RandomOverSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 
 
@@ -317,5 +317,6 @@ if __name__ == "__main__":
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
     )
+
 
 
