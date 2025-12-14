@@ -17,8 +17,8 @@ OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 输出的是“原始划分后的数据”，不做特征处理
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw.csv")
+TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_v3.csv")
+TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_v3.csv")
 
 # 每人每天最多保留的样本数
 MAX_PER_DAY_READ = 30
@@ -158,6 +158,18 @@ def load_one_user_file(path: str) -> pd.DataFrame:
 
     return base
 
+def has_disease_value(x) -> bool:
+    """
+    判断一个疾病单元格是否表示“有疾病”
+    兼容：0/1、是/否、有/无、文本、NaN
+    """
+    if pd.isna(x):
+        return False
+    x = str(x).strip()
+    if x in ("0", "无", "否", "", "nan", "NaN"):
+        return False
+    return True
+
 
 # ========= 主流程：只负责“过滤 + 按人/按类划分” =========
 
@@ -235,20 +247,23 @@ def prepare_and_save_splits(
         ]
         
         # 是否有任意疾病
-        has_any_disease = row[disease_cols].sum(axis=1).iloc[0] > 0
+        has_any_disease = any(
+            has_disease_value(row[col].iloc[0]) for col in disease_cols
+        )
         
         # 是否有循环系统疾病
-        has_circulatory = row["循环系统疾病"].iloc[0] == 1
+        has_circulatory = has_disease_value(row["循环系统疾病"].iloc[0])
+
         
         
         # ===== 应用你的规则 =====
         
-        # 1️⃣ 小于 40 岁：必须完全无疾病
-        if age < 40:
+        # 1️⃣ 小于等于 40 岁：必须完全无疾病
+        if age <= 40:
             if has_any_disease:
                 continue
         
-        # 2️⃣ 大于等于 40 岁：必须有循环系统疾病
+        # 2️⃣ 大于 40 岁：必须有循环系统疾病
         else:
             if not has_circulatory:
                 continue
@@ -314,6 +329,7 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
 
 
 
