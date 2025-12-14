@@ -98,7 +98,7 @@ def create_objective(model_name: str, X_train, y_train):
 
             pipeline = ImbPipeline([
                 ("imputer", SimpleImputer(strategy="mean")),
-                ("upsample", RandomOverSampler(sampling_strategy=0.8, random_state=42)),
+                ("upsample", RandomOverSampler(sampling_strategy="not majority", random_state=42)),
                 ("clf", clf),
             ])
 
@@ -125,7 +125,7 @@ def create_objective(model_name: str, X_train, y_train):
             pipeline = ImbPipeline(steps=[
                 ("imputer", SimpleImputer(strategy="mean")),
                 ("scaler", StandardScaler()),                 # SVM 必须标准化
-                ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
+                ("upsample", RandomOverSampler(sampling_strategy="not majority",random_state=42)),
                 ("clf", clf),
             ])
 
@@ -166,7 +166,7 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
         )
         pipeline = ImbPipeline([
             ("imputer", SimpleImputer(strategy="mean")),
-            ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
+            ("upsample", RandomOverSampler(sampling_strategy="not majority",random_state=42)),
             ("clf", clf_best),
         ])
 
@@ -182,7 +182,7 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
         pipeline = ImbPipeline(steps=[
             ("imputer", SimpleImputer(strategy="mean")),
             ("scaler", StandardScaler()),                 # SVM 必须标准化
-            ("upsample", RandomOverSampler(sampling_strategy=0.8,random_state=42)),
+            ("upsample", RandomOverSampler(sampling_strategy="not majority",random_state=42)),
             ("clf", clf_best),
         ])
 
@@ -317,4 +317,5 @@ if __name__ == "__main__":
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
     )
+
 
