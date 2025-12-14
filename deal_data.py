@@ -11,7 +11,7 @@ from split import split_by_person_stratified,split_by_person_day_window_stratifi
 
 # ========= 路径配置（根据需要修改） =========
 FEATURE_DIR = r"D:/2025_Stage/Code/XGB/ppgfeature_v114"
-USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户列表.csv"
+USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户疾病分类统计.csv"
 
 OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -216,7 +216,45 @@ def prepare_and_save_splits(
         label = age_to_group(age)
         df["label"] = label
 
-        # ========= 新增：先按“每天 cycle 数最多的前 8 个 data_name”过滤 =========
+        # ========= 新增：按“年龄 × 循环系统疾病”筛选用户 =========
+
+        disease_cols = [
+            "某些感染性疾病或寄生虫病",
+            "肿瘤",
+            "血液或造血器官疾病",
+            "免疫系统疾病",
+            "内分泌、营养或代谢疾病",
+            "精神、行为或神经发育障碍",
+            "睡眠-觉醒障碍",
+            "精神系统疾病",
+            "循环系统疾病",
+            "呼吸系统疾病",
+            "消化系统疾病",
+            "肌肉骨骼系统或结缔组织系统疾病",
+            "泌尿生殖系统疾病",
+        ]
+        
+        # 是否有任意疾病
+        has_any_disease = row[disease_cols].sum(axis=1).iloc[0] > 0
+        
+        # 是否有循环系统疾病
+        has_circulatory = row["循环系统疾病"].iloc[0] == 1
+        
+        
+        # ===== 应用你的规则 =====
+        
+        # 1️⃣ 小于 40 岁：必须完全无疾病
+        if age < 40:
+            if has_any_disease:
+                continue
+        
+        # 2️⃣ 大于等于 40 岁：必须有循环系统疾病
+        else:
+            if not has_circulatory:
+                continue
+
+        
+        # ========= 先按“每天 cycle 数最多的前 8 个 data_name”过滤 =========
         df = filter_top_data_names_per_day(df, top_n=8)
 
         if df.empty:
@@ -238,26 +276,26 @@ def prepare_and_save_splits(
     print("用户数量：", df_all["user_id"].nunique())
 
     # === 只做“按人 + 按类”划分，不做任何特征处理 ===
-    #train_df, test_df = split_by_person_stratified(
-    #    df_all,
-    #    user_id_col="user_id",
-    #    label_col="label",
-    #    train_person_ratio=0.8,
-    #    train_per_class=10000,
-    #    test_per_class=3000,
-    #    seed=42,
-    #)
-    train_df, test_df = split_by_person_day_window_stratified(
+    train_df, test_df = split_by_person_stratified(
         df_all,
         user_id_col="user_id",
         label_col="label",
-        date_col="_date_for_limit",
-        train_days=5,
-        test_days=3,
-        train_per_class=6000,
-        test_per_class=2000,
+        train_person_ratio=0.8,
+        train_per_class=10000,
+        test_per_class=3000,
         seed=42,
     )
+    #train_df, test_df = split_by_person_day_window_stratified(
+    #    df_all,
+    #    user_id_col="user_id",
+    #    label_col="label",
+    #    date_col="_date_for_limit",
+    #    train_days=5,
+    #    test_days=3,
+    #    train_per_class=6000,
+    #    test_per_class=2000,
+    #    seed=42,
+    #)
 
     # 删除采样临时列
     for col in ["_date_for_limit"]:
@@ -276,5 +314,6 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
 
 
