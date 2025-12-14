@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from split import split_by_person_stratified
+from split import split_by_person_day_window_stratified
 
 
 # ========= 路径配置（根据需要修改） =========
@@ -17,8 +18,10 @@ OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 输出的是“原始划分后的数据”，不做特征处理
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw.csv")
+#TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw.csv")
+#TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw.csv")
+TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_2.csv")
+TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_2.csv")
 
 # 每人每天最多保留的样本数
 MAX_PER_DAY_READ = 30
@@ -238,13 +241,24 @@ def prepare_and_save_splits(
     print("用户数量：", df_all["user_id"].nunique())
 
     # === 只做“按人 + 按类”划分，不做任何特征处理 ===
-    train_df, test_df = split_by_person_stratified(
+    #train_df, test_df = split_by_person_stratified(
+    #    df_all,
+    #    user_id_col="user_id",
+    #    label_col="label",
+    #    train_person_ratio=0.8,
+    #    train_per_class=10000,
+    #    test_per_class=3000,
+    #    seed=42,
+    #)
+    train_df, test_df = split_by_person_day_window_stratified(
         df_all,
         user_id_col="user_id",
         label_col="label",
-        train_person_ratio=0.8,
-        train_per_class=10000,
-        test_per_class=3000,
+        date_col="_date_for_limit",
+        train_days=5,
+        test_days=3,
+        train_per_class=6000,
+        test_per_class=2000,
         seed=42,
     )
 
@@ -265,3 +279,4 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
