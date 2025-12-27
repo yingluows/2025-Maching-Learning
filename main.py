@@ -21,37 +21,22 @@ from imblearn.base import BaseSampler
 from sklearn.utils import check_random_state
 
 
-
-# ========= Matplotlib 中文设置 =========
 matplotlib.rcParams["font.sans-serif"] = ["SimHei"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 
-# ========= 路径配置（按需修改） =========
-BASE_DIR = r"D:/2025_Stage/Code/XGB"
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
 SAVE_FIG_DIR = os.path.join(BASE_DIR, "Save_fig")
 SAVE_MODEL_DIR = os.path.join(BASE_DIR, "Save_model")
-
 os.makedirs(SAVE_FIG_DIR, exist_ok=True)
 os.makedirs(SAVE_MODEL_DIR, exist_ok=True)
 
-# 数据划分路径
 TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v5.csv")
 TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v5.csv")
 
 
-# ========= 数据读取 =========
-
-def load_data_from_csv(
-    train_feat_path: str = TRAIN_FEAT_PATH,
-    test_feat_path: str = TEST_FEAT_PATH,
-):
-    """
-    直接从 select_feature.py 导出的 train/test CSV 读取数据。
-    假设这两个文件已经做完特征处理，并包含 label 列与 user_id 列（user_id 仅用于分组）。
-    """
+def load_data_from_csv(train_feat_path: str = TRAIN_FEAT_PATH, test_feat_path: str = TEST_FEAT_PATH):
     train_df = pd.read_csv(train_feat_path)
     test_df = pd.read_csv(test_feat_path)
 
@@ -59,7 +44,7 @@ def load_data_from_csv(
     print("特征测试集形状：", test_df.shape)
 
     if "user_id" not in train_df.columns or "user_id" not in test_df.columns:
-        raise ValueError("未在 train/test 特征文件中找到 user_id 列。请先运行 select_feature_scheme1.py 重新生成 train_v*.csv / test_v*.csv")
+        raise ValueError("未在 train/test 特征文件中找到 user_id 列。请先运行 select_feature.py。")
 
     groups_train = train_df["user_id"].astype(str)
     groups_test = test_df["user_id"].astype(str)
@@ -69,41 +54,40 @@ def load_data_from_csv(
     X_test = test_df.drop(columns=["label", "user_id"])
     y_test = test_df["label"]
 
-    # 再保险处理一下 inf
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
     X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
     return X_train, X_test, y_train, y_test, groups_train, groups_test
 
+
 class GaussianNoiseOverSampler(BaseSampler):
     """
-    把每个类别上采样到与多数类相同的数量，并对“新增的复制样本”添加高斯噪声。
-    - 只对数值特征加噪（你在 select_feature.py 最终保留的是数值特征，这里适配） :contentReference[oaicite:1]{index=1}
-    - 噪声强度按每个特征的 std * noise_scale
+    ✅ 少数类补齐到多数类数量，并对新增样本添加高斯噪声
+    只会在训练阶段/训练fold里生效（放进 imblearn Pipeline）
     """
     _sampling_type = "over-sampling"
-
     _parameter_constraints = {}
 
-    def __init__(self, noise_scale=0.01, sampling_strategy="auto", random_state=42, clip=None):
+    def __init__(self, noise_scale=0.01, sampling_strategy="auto", random_state=42, clip=None, max_target=None):
         super().__init__(sampling_strategy=sampling_strategy)
         self.noise_scale = float(noise_scale)
         self.random_state = random_state
-        self.clip = clip  # 可选：如 (-5, 5) 限制扰动后的值
+        self.clip = clip
+        self.max_target = max_target  # 可选：限制补齐目标（防止数据爆炸）
 
     def _fit_resample(self, X, y):
         rng = check_random_state(self.random_state)
 
-        # 转 numpy
         X_np = X.to_numpy() if hasattr(X, "to_numpy") else X
         y_np = y.to_numpy() if hasattr(y, "to_numpy") else y
 
         classes, counts = np.unique(y_np, return_counts=True)
         max_count = counts.max()
+        if self.max_target is not None:
+            max_count = min(max_count, int(self.max_target))
 
-        # 每列 std，用于设置噪声尺度
         col_std = np.std(X_np, axis=0, ddof=0)
-        col_std[col_std == 0] = 1.0  # 防止全0列
+        col_std[col_std == 0] = 1.0
 
         X_out = [X_np]
         y_out = [y_np]
@@ -114,11 +98,9 @@ class GaussianNoiseOverSampler(BaseSampler):
                 continue
 
             idx_c = np.flatnonzero(y_np == c)
-            # 从该类中有放回抽样
             pick = rng.choice(idx_c, size=n_add, replace=True)
             X_new = X_np[pick].copy()
 
-            # 只对新增样本加噪声
             noise = rng.normal(loc=0.0, scale=col_std * self.noise_scale, size=X_new.shape)
             X_new = X_new + noise
 
@@ -131,13 +113,10 @@ class GaussianNoiseOverSampler(BaseSampler):
 
         X_res = np.vstack(X_out)
         y_res = np.concatenate(y_out)
-
         return X_res, y_res
 
 
-# ========= Optuna 目标函数 =========
-
-def create_objective(model_name: str, X_train, y_train, groups_train):
+def create_objective(model_name: str, X_train, y_train, groups_train, noise_scale: float, max_target: int | None):
     model_name = model_name.lower()
 
     def objective(trial):
@@ -164,58 +143,67 @@ def create_objective(model_name: str, X_train, y_train, groups_train):
 
             pipeline = ImbPipeline([
                 ("imputer", SimpleImputer(strategy="mean")),
+                ("over", GaussianNoiseOverSampler(noise_scale=noise_scale, random_state=42, max_target=max_target)),
                 ("clf", clf),
             ])
 
-
         elif model_name == "svm":
-            # SVM 对尺度敏感：必须标准化
             kernel = trial.suggest_categorical("kernel", ["rbf", "linear", "poly", "sigmoid"])
             C = trial.suggest_float("C", 1e-2, 1e2, log=True)
 
             params = {"kernel": kernel, "C": C}
-
             if kernel in ("rbf", "poly", "sigmoid"):
                 params["gamma"] = trial.suggest_float("gamma", 1e-4, 1e0, log=True)
             if kernel == "poly":
                 params["degree"] = trial.suggest_int("degree", 2, 5)
 
             clf = SVC(
-                probability=True,  # 便于后续 SHAP/评估输出概率
+                probability=True,
                 decision_function_shape="ovr",
                 random_state=42,
                 **params,
             )
 
-            pipeline = ImbPipeline(steps=[
+            pipeline = ImbPipeline([
                 ("imputer", SimpleImputer(strategy="mean")),
-                ("scaler", StandardScaler()),                 # SVM 必须标准化
+                ("over", GaussianNoiseOverSampler(noise_scale=noise_scale, random_state=42, max_target=max_target)),
+                ("scaler", StandardScaler()),
                 ("clf", clf),
             ])
 
         else:
-            raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
+            raise ValueError("model 只能是 xgb 或 svm")
 
         gkf = GroupKFold(n_splits=5)
         score = cross_val_score(
-            pipeline, X_train, y_train,
+            pipeline,
+            X_train,
+            y_train,
             cv=gkf,
             groups=groups_train,
-            scoring="accuracy"
+            scoring="accuracy",
         ).mean()
         return score
 
     return objective
 
 
-# ========= 训练 / 评估 =========
-
-def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, groups_train, n_trials: int = 30, run_shap_flag: bool = True):
+def train_and_evaluate(
+    model_name: str,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    groups_train,
+    n_trials: int = 30,
+    run_shap_flag: bool = True,
+    noise_scale: float = 0.01,
+    max_target: int | None = None,
+):
     model_name = model_name.lower()
 
-    # Optuna 调参
     study = optuna.create_study(direction="maximize")
-    study.optimize(create_objective(model_name, X_train, y_train, groups_train), n_trials=n_trials)
+    study.optimize(create_objective(model_name, X_train, y_train, groups_train, noise_scale, max_target), n_trials=n_trials)
 
     print("最优参数：", study.best_params)
     print("最优交叉验证准确率：", study.best_value)
@@ -232,10 +220,9 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, groups
         )
         pipeline = ImbPipeline([
             ("imputer", SimpleImputer(strategy="mean")),
+            ("over", GaussianNoiseOverSampler(noise_scale=noise_scale, random_state=42, max_target=max_target)),
             ("clf", clf_best),
         ])
-
-
 
     elif model_name == "svm":
         clf_best = SVC(
@@ -244,26 +231,25 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, groups
             random_state=42,
             **best_params,
         )
-        pipeline = ImbPipeline(steps=[
+        pipeline = ImbPipeline([
             ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", StandardScaler()),                 # SVM 必须标准化
+            ("over", GaussianNoiseOverSampler(noise_scale=noise_scale, random_state=42, max_target=max_target)),
+            ("scaler", StandardScaler()),
             ("clf", clf_best),
         ])
 
     else:
-        raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
+        raise ValueError("model 只能是 xgb 或 svm")
 
     pipeline.fit(X_train, y_train)
     y_pred = pipeline.predict(X_test)
 
-    # 分类报告
     report_dict = classification_report(y_test, y_pred, output_dict=True)
     df_report = pd.DataFrame(report_dict).T
     report_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_classification_report.csv")
     df_report.to_csv(report_path, encoding="utf-8-sig")
     print(f"分类报告已保存到: {report_path}")
 
-    # 混淆矩阵
     ConfusionMatrixDisplay.from_estimator(
         pipeline, X_test, y_test,
         display_labels=sorted(y_train.unique()),
@@ -276,12 +262,10 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, groups
     plt.show()
     print(f"混淆矩阵已保存到: {cm_path}")
 
-    # 保存模型
     model_path = os.path.join(SAVE_MODEL_DIR, f"{model_name}_model.pkl")
     joblib.dump(pipeline, model_path)
     print(f"模型已保存到: {model_path}")
 
-    # SHAP 模型解释
     if run_shap_flag:
         run_shap(model_name, pipeline, X_test)
 
@@ -290,8 +274,6 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, groups
 
 def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
     model_name = model_name.lower()
-
-    # 取部分样本
     sample_X = X_test.sample(n=min(200, len(X_test)), random_state=42)
 
     if model_name == "xgb":
@@ -300,24 +282,18 @@ def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
         values = shap_values.values
 
     elif model_name == "svm":
-        # KernelExplainer 相对慢：控制背景集和采样数
         background = sample_X.sample(n=min(50, len(sample_X)), random_state=42)
-
-        # 解释概率输出（多分类时返回 n_samples x n_classes）
         explainer = shap.KernelExplainer(pipeline.predict_proba, background)
         shap_values = explainer.shap_values(sample_X, nsamples=100)
 
-        # shap_values: list[n_classes] of (n_samples, n_features) 或 (n_samples, n_features, n_classes)
         if isinstance(shap_values, list):
-            # (n_classes, n_samples, n_features) -> (n_samples, n_features, n_classes)
             values = np.stack(shap_values, axis=-1)
         else:
             values = np.array(shap_values)
 
     else:
-        raise ValueError(f"不支持的 model: {model_name}")
+        raise ValueError("model 只能是 xgb 或 svm")
 
-    # 统一：把多分类维度聚合成 (n_samples, n_features)
     if values.ndim == 3:
         values_agg = np.mean(np.abs(values), axis=2) * np.sign(np.mean(values, axis=2))
         importance = np.mean(np.abs(values), axis=(0, 2))
@@ -325,7 +301,6 @@ def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
         values_agg = values
         importance = np.mean(np.abs(values), axis=0)
 
-    # SHAP summary dot
     plt.figure()
     shap.summary_plot(values_agg, sample_X, show=False)
     plt.title(f"{model_name.upper()} SHAP Summary (Dot)")
@@ -334,7 +309,6 @@ def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
     plt.close()
     print(f"SHAP dot 图已保存到: {shap_dot_path}")
 
-    # SHAP bar
     plt.figure()
     shap.summary_plot(values_agg, sample_X, plot_type="bar", show=False)
     plt.title(f"{model_name.upper()} SHAP Summary (Bar)")
@@ -343,35 +317,28 @@ def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
     plt.close()
     print(f"SHAP bar 图已保存到: {shap_bar_path}")
 
-    # 导出全部特征重要性
-    importance_all = pd.DataFrame({
-        "feature": sample_X.columns,
-        "importance": importance,
-    }).sort_values(by="importance", ascending=False)
-
-    print("\n=== 前 20 特征 ===")
-    print(importance_all.head(20))
-
+    importance_all = pd.DataFrame({"feature": sample_X.columns, "importance": importance}).sort_values(by="importance", ascending=False)
     importance_csv_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_feature_importance.csv")
     importance_all.to_csv(importance_csv_path, index=False, encoding="utf-8-sig")
-    print(f"所有特征重要性排名已保存到：{importance_csv_path}")
+    print(f"所有特征重要性已保存到：{importance_csv_path}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="xgb", choices=["xgb", "svm"], help="选择模型：xgb 或 svm")
-    parser.add_argument("--trials", type=int, default=30, help="Optuna 迭代次数")
-    parser.add_argument("--no_shap", action="store_true", help="不运行 SHAP（SVM 会更快）")
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="xgb", choices=["xgb", "svm"])
+    p.add_argument("--trials", type=int, default=30)
+    p.add_argument("--no_shap", action="store_true")
+    p.add_argument("--noise_scale", type=float, default=0.01, help="上采样新增样本的噪声强度（std*noise_scale）")
+    p.add_argument("--max_target", type=int, default=-1, help="限制补齐目标，-1 表示不限制（防止训练集爆炸）")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    max_target = None if args.max_target == -1 else args.max_target
 
-    # 直接读 select_feature 导出的 CSV
     X_train, X_test, y_train, y_test, groups_train, groups_test = load_data_from_csv()
 
-    # 调参 + 训练 + 评估
     train_and_evaluate(
         model_name=args.model,
         X_train=X_train,
@@ -381,6 +348,6 @@ if __name__ == "__main__":
         groups_train=groups_train,
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
+        noise_scale=args.noise_scale,
+        max_target=max_target,
     )
-
-
