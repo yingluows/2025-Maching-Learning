@@ -12,17 +12,16 @@ DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
 os.makedirs(DATA_SPLIT_DIR, exist_ok=True)
 
 # deal_data 输出的原始划分结果
-TRAIN_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "train_raw.csv")
-TEST_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "test_raw.csv")
+TRAIN_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "train_raw_v5.csv")
+TEST_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "test_raw_v5.csv")
 
 # 本文件要输出的“特征处理后”的数据
-TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v1.csv")
-TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v1.csv")
+TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v5.csv")
+TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v5.csv")
 
 
 # ========= 皮尔逊结果配置 =========
-# ⚠ 请把这些文件放在 PEARSON_DIR 下，或者改成你实际存放路径
-PEARSON_DIR = BASE_DIR
+PEARSON_DIR = os.path.join(BASE_DIR, "PEARSON_DIR")
 
 PEARSON_FILES = [
     "Feature_prv皮尔逊分析.csv",
@@ -75,7 +74,7 @@ def get_high_corr_feature_names(
     return selected
 
 
-# 在模块加载时就读一次皮尔逊结果，构建“高相关特征白名单”
+# 在模块加载时读皮尔逊结果，构建高相关特征白名单
 HIGH_CORR_FEATURES = get_high_corr_feature_names()
 
 
@@ -140,8 +139,7 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
     - 返回：仅保留数值特征 + label
     """
     drop_not_features = [
-        "user_id",
-        "data_name",
+"data_name",
         "group_id",
         "person_day",
         "select_number",
@@ -176,10 +174,10 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
             errors="ignore",
         )
 
-        # 4. 分离 label
+        # 4. 分离 label 与 user_id（user_id 仅用于后续 GroupKFold 分组，不作为特征）
         label = df["label"]
-        feature_df = df.drop(columns=["label"])
-
+        user_id = df["user_id"] if "user_id" in df.columns else None
+        feature_df = df.drop(columns=[c for c in ["label", "user_id"] if c in df.columns])
         # 5. 删掉所有 *_x, *_y，只保留 *_mag 和其他数值列
         feature_df = feature_df.drop(
             columns=[c for c in feature_df.columns if c.endswith("_x") or c.endswith("_y")],
@@ -211,7 +209,15 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
         else:
             print("[deal_file] 没有皮尔逊白名单（HIGH_CORR_FEATURES 为空），保留全部特征。")
 
-        df_processed = pd.concat([feature_df, label], axis=1)
+        # 8. 重新拼回 user_id（便于后续 GroupKFold；训练时会 drop 掉它）
+        if user_id is not None:
+            df_processed = pd.concat([
+                user_id.reset_index(drop=True),
+                feature_df.reset_index(drop=True),
+                label.reset_index(drop=True),
+            ], axis=1)
+        else:
+            df_processed = pd.concat([feature_df, label], axis=1)
         return df_processed
 
     train_df = _process(train_df)
@@ -233,7 +239,7 @@ def make_feature_csvs(
       1) 展开 "[a,b]" 特征
       2) 删除非特征列，合成 *_mag，删掉 object 列
       3) 根据皮尔逊结果只保留高相关特征
-      4) 保存为 train_feat.csv / test_feat.csv （包含 label）
+      4) 保存为 train_vn.csv / test_vn.csv （包含 label）
     """
     # 读取 raw 划分结果（含所有原始列）
     train_df = pd.read_csv(train_raw_path)
@@ -262,6 +268,5 @@ def make_feature_csvs(
 
 
 if __name__ == "__main__":
-    # 单独运行本文件：直接生成 train_feat.csv / test_feat.csv
+    # 单独运行本文件：直接生成 train.csv / test.csv
     make_feature_csvs()
-
