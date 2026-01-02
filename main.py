@@ -1,339 +1,393 @@
-# deal_data.py
+# main.py
 """
-数据划分脚本（v7策略）
-- 不再随机抽取样本：对每个用户的每一天取特征均值（daily mean）
-- 保留 50 岁疾病过滤规则：
-    * age <= 50：必须无任何疾病
-    * age  > 50：必须有“循环系统疾病”
-- 训练集/测试集按【人数】划分（按 label 分层），并保留 user_id（用于可追溯/按人划分）
-- 输出为原始划分后的 CSV：train_raw_v7.csv / test_raw_v7.csv
+训练与评估脚本（v7策略）
+- 输入：select_feature.py 输出的 train_v7.csv / test_v7.csv
+- 训练：可选 XGB 或 SVM，Optuna 调参
+- 训练前：可选高斯噪声上采样（仅训练集）
+- 测试：输出 strict accuracy / classification report / confusion matrix
+- 额外：若 CSV 包含 age，则计算 tolerant accuracy（仅评估，不参与训练）
 """
 
 import os
-import glob
-from typing import List, Tuple
+import argparse
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
+import optuna
 import pandas as pd
-from tqdm import tqdm
+import joblib
+
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import (
+    classification_report,
+    ConfusionMatrixDisplay,
+    accuracy_score,
+)
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+
+# ========= Matplotlib 中文设置 =========
+matplotlib.rcParams["font.sans-serif"] = ["SimHei"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+# ========= 路径配置 =========
+BASE_DIR = r"D:/2025_Stage/Code/XGB"
+DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
+SAVE_FIG_DIR = os.path.join(BASE_DIR, "Save_fig")
+SAVE_MODEL_DIR = os.path.join(BASE_DIR, "Save_model")
+
+os.makedirs(SAVE_FIG_DIR, exist_ok=True)
+os.makedirs(SAVE_MODEL_DIR, exist_ok=True)
+
+TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v7.csv")
+TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v7.csv")
+
+FORBIDDEN_COLS = ("user_id",)  # 双保险
 
 
-# ========= 路径配置（根据需要修改） =========
-FEATURE_DIR = r"D:/2025_Stage/Code/XGB/ppgfeature_v114"
-USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户疾病分类统计.csv"
+# ========= tolerant accuracy =========
+LABEL_TO_RANGE = {
+    0: (0, 20),
+    1: (21, 30),
+    2: (31, 40),
+    3: (41, 50),
+    4: (51, 60),
+    5: (61, None),
+}
 
-OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def expanded_range(label: int, tol: int = 2):
+    low, high = LABEL_TO_RANGE[int(label)]
+    low2 = max(0, low - tol)
+    high2 = None if high is None else (high + tol)
+    return low2, high2
 
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_v7.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_v7.csv")
+def tolerant_accuracy(y_pred_label, y_true_age, tol: int = 2):
+    y_pred_label = np.asarray(y_pred_label).astype(int)
+    y_true_age = np.asarray(y_true_age).astype(float)
 
-# 每天只保留 cycle 数最多的前 N 个 data_name（保留你原来的逻辑；不想要可改成 None）
-TOP_DATA_NAME_PER_DAY = 8
-
-
-# ========= 标签分段 =========
-def age_to_group(age: int) -> int:
-    age = int(age)
-    if age <= 20:
-        return 0
-    elif age <= 30:
-        return 1
-    elif age <= 40:
-        return 2
-    elif age <= 50:
-        return 3
-    elif age <= 60:
-        return 4
-    else:
-        return 5
-
-
-# ========= 日期解析 =========
-def ensure_date_column(df: pd.DataFrame, date_col: str = "_date_for_limit") -> pd.DataFrame:
-    """
-    确保存在一个表示“日期”的列（YYYY-MM-DD 字符串），从 data_name 中解析：
-    data_name 形如 xxx_YYYYMMDDhhmmss，取中间 YYYYMMDD。
-    """
-    df = df.copy()
-    if date_col in df.columns:
-        return df
-
-    if "data_name" not in df.columns:
-        raise ValueError("缺少 data_name 列，无法解析日期。")
-
-    def _parse_date(x: str) -> str:
-        s = str(x)
-        # 尝试从字符串中提取 8 位日期
-        # 常见：xxx_20240102123000 或 xxx-20240102123000
-        import re
-        m = re.search(r"(20\d{6})", s)
-        if not m:
-            return "1970-01-01"
-        ymd = m.group(1)
-        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
-
-    df[date_col] = df["data_name"].apply(_parse_date)
-    return df
+    ok = np.zeros_like(y_true_age, dtype=bool)
+    for i, lab in enumerate(y_pred_label):
+        low2, high2 = expanded_range(lab, tol=tol)
+        if high2 is None:
+            ok[i] = (y_true_age[i] >= low2)
+        else:
+            ok[i] = (low2 <= y_true_age[i] <= high2)
+    return float(ok.mean())
 
 
-# ========= 每天取 cycle 数最多的前 N 个 data_name =========
-def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
-    """
-    对每个用户、每一天，统计每个 data_name 的 cycle_number 行数（近似 cycle 数），
-    取 cycle 数最多的前 top_n 个 data_name，保留对应行。
-    """
-    if top_n is None:
-        return df
-
-    if "data_name" not in df.columns or "cycle_number" not in df.columns:
-        print("⚠ 缺少 data_name/cycle_number，无法按每天前 N 个 data_name 过滤，原样返回。")
-        return df
-
-    df = ensure_date_column(df, date_col="_date_for_limit")
-
-    # (user, date, data_name) -> count
-    grp = (
-        df.groupby(["user_id", "_date_for_limit", "data_name"])["cycle_number"]
-        .count()
-        .reset_index(name="cycle_count")
-    )
-
-    # 每个 (user,date) 取 top_n 个 data_name
-    grp = grp.sort_values(["user_id", "_date_for_limit", "cycle_count"], ascending=[True, True, False])
-    top = grp.groupby(["user_id", "_date_for_limit"]).head(top_n)
-
-    keep = df.merge(
-        top[["user_id", "_date_for_limit", "data_name"]],
-        on=["user_id", "_date_for_limit", "data_name"],
-        how="inner",
-    )
-    return keep
-
-
-# ========= 合并一个用户的多 sheet 特征 =========
-def load_one_user_file(path: str) -> pd.DataFrame:
-    """
-    你的特征文件如果是 Excel（多 sheet），这里按你原来的 sheet 名读取并合并。
-    如果你的文件结构不同，可以在这里调整。
-    """
-    df_prv = pd.read_excel(path, sheet_name="feature_prv")
-    df_time = pd.read_excel(path, sheet_name="feature_time")
-    df_welch1 = pd.read_excel(path, sheet_name="feature_welch_1")
-    df_welch2 = pd.read_excel(path, sheet_name="feature_welch_2")
-    df_ref = pd.read_excel(path, sheet_name="reference_time")
-    df_freq1 = pd.read_excel(path, sheet_name="feature_frequency_1")
-    df_freq2 = pd.read_excel(path, sheet_name="feature_frequency_2")
-
-    def smart_merge(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-        cand_keys = ["user_id", "data_name", "cycle_number", "select_number", "total_select_number"]
-        keys = [k for k in cand_keys if k in left.columns and k in right.columns]
-        if not keys:
-            # 找不到共同 key，就按 index 连接（不推荐，但兜底）
-            return pd.concat([left.reset_index(drop=True), right.reset_index(drop=True)], axis=1)
-        return pd.merge(left, right, on=keys, how="inner")
-
-    base = smart_merge(df_prv, df_time)
-    base = smart_merge(base, df_welch1)
-    base = smart_merge(base, df_welch2)
-    base = smart_merge(base, df_ref)
-    base = smart_merge(base, df_freq1)
-    base = smart_merge(base, df_freq2)
-    return base
-
-
-# ========= 疾病判断 =========
-def has_disease_value(x) -> bool:
-    """
-    判断一个疾病单元格是否表示“有疾病”
-    兼容：0/1、是/否、有/无、文本、NaN
-    """
-    if pd.isna(x):
-        return False
-    x = str(x).strip()
-    if x in ("0", "无", "否", "", "nan", "NaN"):
-        return False
-    return True
-
-
-def daily_mean_aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    对每个用户的每一天取均值（只对数值列）。
-    保留列：
-      - user_id
-      - _date_for_limit
-      - age, label（在进入该函数前已填好）
-      - 其他数值列：mean
-    """
-    df = ensure_date_column(df, date_col="_date_for_limit")
-
-    # 保证 age/label 存在（应当恒定）
-    if "age" not in df.columns or "label" not in df.columns:
-        raise ValueError("daily_mean_aggregate 需要 df 中包含 age 和 label。")
-
-    group_cols = ["user_id", "_date_for_limit"]
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-    # 但 user_id/date 不在 numeric；age/label 在 numeric，均值不变
-    agg = df.groupby(group_cols, as_index=False)[numeric_cols].mean()
-
-    # 把 age/label 保持为 int（均值后可能是 float）
-    agg["age"] = agg["age"].round().astype(int)
-    agg["label"] = agg["label"].round().astype(int)
-
-    return agg
-
-
-def split_by_person_stratified_no_sampling(
-    df: pd.DataFrame,
-    user_id_col: str = "user_id",
+def load_data_from_csv(
+    train_feat_path: str = TRAIN_FEAT_PATH,
+    test_feat_path: str = TEST_FEAT_PATH,
     label_col: str = "label",
-    train_person_ratio: float = 0.8,
+    age_col: str = "age",
+):
+    train_df = pd.read_csv(train_feat_path)
+    test_df = pd.read_csv(test_feat_path)
+
+    print("特征训练集形状：", train_df.shape)
+    print("特征测试集形状：", test_df.shape)
+
+    if label_col not in train_df.columns or label_col not in test_df.columns:
+        raise ValueError(f"CSV 中必须包含列 '{label_col}' 作为类别标签。")
+
+    # y
+    y_train = train_df[label_col].astype(int)
+    y_test = test_df[label_col].astype(int)
+
+    # age（可选，仅用于 tolerant accuracy）
+    y_test_age = test_df[age_col] if age_col in test_df.columns else None
+
+    # X：drop label/age/forbidden
+    drop_train = [label_col]
+    if age_col in train_df.columns:
+        drop_train.append(age_col)
+    drop_train += [c for c in FORBIDDEN_COLS if c in train_df.columns]
+
+    drop_test = [label_col]
+    if age_col in test_df.columns:
+        drop_test.append(age_col)
+    drop_test += [c for c in FORBIDDEN_COLS if c in test_df.columns]
+
+    X_train = train_df.drop(columns=drop_train, errors="ignore")
+    X_test = test_df.drop(columns=drop_test, errors="ignore")
+
+    # 双保险：防止 user_id 混入
+    for c in FORBIDDEN_COLS:
+        if c in X_train.columns:
+            X_train = X_train.drop(columns=[c], errors="ignore")
+        if c in X_test.columns:
+            X_test = X_test.drop(columns=[c], errors="ignore")
+
+    # inf -> nan
+    X_train = X_train.replace([np.inf, -np.inf], np.nan)
+    X_test = X_test.replace([np.inf, -np.inf], np.nan)
+
+    return X_train, X_test, y_train, y_test, y_test_age
+
+
+def gaussian_noise_oversample(
+    X: pd.DataFrame,
+    y: pd.Series,
+    target: str = "max",
+    sigma: float = 0.02,
     seed: int = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+):
     """
-    按人分层划分（不做 per-class 样本抽取），保证 train/test 的 user 不重叠。
+    高斯噪声上采样（只对数值特征有效；缺失值用均值填充用于生成样本）
     """
     rng = np.random.RandomState(seed)
 
-    user_label = (
-        df.groupby(user_id_col)[label_col]
-        .first()
-        .reset_index()
-    )
+    y = pd.Series(y).reset_index(drop=True)
+    X = X.reset_index(drop=True)
 
-    train_users = []
-    test_users = []
+    col_means = X.mean(numeric_only=True)
+    X_imp = X.copy().fillna(col_means)
 
-    for lab, sub in user_label.groupby(label_col):
-        users = sub[user_id_col].tolist()
-        rng.shuffle(users)
-        n_train = int(round(len(users) * train_person_ratio))
-        train_users.extend(users[:n_train])
-        test_users.extend(users[n_train:])
+    col_std = X_imp.std(numeric_only=True).replace(0, 1e-12)
+    col_std_arr = col_std.values.astype(float)
 
-    train_df = df[df[user_id_col].isin(train_users)].reset_index(drop=True)
-    test_df = df[df[user_id_col].isin(test_users)].reset_index(drop=True)
+    counts = y.value_counts()
+    if target == "max":
+        target_n = int(counts.max())
+    else:
+        target_n = int(target)
 
-    # 安全检查
-    inter = set(train_users).intersection(set(test_users))
-    if inter:
-        raise RuntimeError(f"train/test 用户集合有重叠：{len(inter)} 个")
+    X_new_list = [X_imp]
+    y_new_list = [y]
 
-    return train_df, test_df
+    for cls, n in counts.items():
+        if n >= target_n:
+            continue
+        need = target_n - int(n)
+
+        idx_cls = np.where(y.values == cls)[0]
+        pick_idx = rng.choice(idx_cls, size=need, replace=True)
+
+        base = X_imp.iloc[pick_idx].to_numpy(dtype=float)
+        noise = rng.normal(loc=0.0, scale=sigma * col_std_arr, size=base.shape)
+        synth = base + noise
+
+        X_synth = pd.DataFrame(synth, columns=X_imp.columns)
+        y_synth = pd.Series([cls] * need)
+
+        X_new_list.append(X_synth)
+        y_new_list.append(y_synth)
+
+    X_os = pd.concat(X_new_list, ignore_index=True)
+    y_os = pd.concat(y_new_list, ignore_index=True)
+
+    print("\n=== 高斯噪声上采样完成 ===")
+    print("sigma =", sigma, "| target =", target_n)
+    print("上采样前：\n", counts.sort_index())
+    print("上采样后：\n", y_os.value_counts().sort_index())
+    print("训练集样本数：", len(y), "->", len(y_os))
+
+    return X_os, y_os
 
 
-def prepare_and_save_splits(
-    feature_dir: str = FEATURE_DIR,
-    user_info_path: str = USER_INFO_PATH,
-    train_csv_path: str = TRAIN_CSV_PATH,
-    test_csv_path: str = TEST_CSV_PATH,
+def create_objective(model_name: str, X_train, y_train, cv: int = 5):
+    model_name = model_name.lower()
+
+    def objective(trial):
+        if model_name == "xgb":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 150, 700),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 10.0),
+                "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+
+            clf = XGBClassifier(
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                n_jobs=-1,
+                random_state=42,
+                **params,
+            )
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("clf", clf),
+            ])
+
+        elif model_name == "svm":
+            kernel = trial.suggest_categorical("kernel", ["rbf", "linear", "poly", "sigmoid"])
+            C = trial.suggest_float("C", 1e-2, 1e2, log=True)
+
+            params = {"kernel": kernel, "C": C}
+
+            if kernel in ("rbf", "poly", "sigmoid"):
+                params["gamma"] = trial.suggest_float("gamma", 1e-4, 1e0, log=True)
+            if kernel == "poly":
+                params["degree"] = trial.suggest_int("degree", 2, 5)
+
+            clf = SVC(
+                probability=True,
+                decision_function_shape="ovr",
+                random_state=42,
+                **params,
+            )
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("scaler", StandardScaler()),
+                ("clf", clf),
+            ])
+        else:
+            raise ValueError("model 仅支持 xgb 或 svm")
+
+        score = cross_val_score(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring="accuracy",
+            n_jobs=-1,
+        ).mean()
+        return score
+
+    return objective
+
+
+def train_and_evaluate(
+    model_name: str,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    y_test_age=None,
+    n_trials: int = 30,
+    tol: int = 2,
 ):
-    user_info = pd.read_csv(user_info_path)
-    user_info["user_id"] = user_info["user_id"].astype(str).str.lstrip("_")
+    model_name = model_name.lower()
 
-    # 疾病列：除 user_id、年龄 外的所有列都视为疾病字段（按你的表结构）
-    possible_non_disease = {"user_id", "年龄"}
-    disease_cols = [c for c in user_info.columns if c not in possible_non_disease]
+    # Optuna 调参
+    study = optuna.create_study(direction="maximize")
+    study.optimize(create_objective(model_name, X_train, y_train), n_trials=n_trials)
 
-    all_daily = []
+    print("\n=== Optuna 最优结果 ===")
+    print("最优参数：", study.best_params)
+    print("最优 CV accuracy：", study.best_value)
 
-    # 收集文件
-    feature_files: List[str] = []
-    feature_files.extend(glob.glob(os.path.join(feature_dir, "*.xlsx")))
-    feature_files.extend(glob.glob(os.path.join(feature_dir, "*.csv")))
-    feature_files = sorted(feature_files)
+    best_params = study.best_params.copy()
 
-    for path in tqdm(feature_files, desc="正在加载用户特征数据"):
-        name = os.path.basename(path)
-        if name.startswith("~$"):
-            continue
+    if model_name == "xgb":
+        clf_best = XGBClassifier(
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            n_jobs=-1,
+            random_state=42,
+            **best_params,
+        )
+        pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="mean")),
+            ("clf", clf_best),
+        ])
+    else:
+        clf_best = SVC(
+            probability=True,
+            decision_function_shape="ovr",
+            random_state=42,
+            **best_params,
+        )
+        pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="mean")),
+            ("scaler", StandardScaler()),
+            ("clf", clf_best),
+        ])
 
-        user_id_from_name = os.path.splitext(os.path.basename(path))[0]
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
 
-        # 读取特征
-        if path.lower().endswith(".csv"):
-            df = pd.read_csv(path)
-        elif path.lower().endswith(".xlsx"):
-            df = load_one_user_file(path)
-        else:
-            continue
+    # 指标
+    acc = accuracy_score(y_test, y_pred)
+    print(f"\n✅ Strict Accuracy: {acc:.4f}")
 
-        # 确保 user_id
-        if "user_id" in df.columns:
-            df["user_id"] = df["user_id"].astype(str).str.lstrip("_")
-            user_id_in_file = str(df["user_id"].iloc[0])
-            user_id_from_name = user_id_in_file
-        else:
-            df["user_id"] = str(user_id_from_name).lstrip("_")
+    if y_test_age is not None:
+        tacc = tolerant_accuracy(y_pred, y_test_age.values, tol=tol)
+        print(f"✅ Tolerant Accuracy (±{tol}岁): {tacc:.4f}")
 
-        uid = str(user_id_from_name).lstrip("_")
+        tol_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_tolerant_accuracy.txt")
+        with open(tol_path, "w", encoding="utf-8") as f:
+            f.write(f"accuracy={acc:.6f}\n")
+            f.write(f"tolerant_accuracy_tol_{tol}={tacc:.6f}\n")
+        print(f"tolerant 指标已保存：{tol_path}")
+    else:
+        print("⚠ 未检测到 age 列，跳过 tolerant accuracy。")
 
-        # 查用户信息
-        row = user_info[user_info["user_id"] == uid]
-        if row.empty:
-            # 找不到用户信息就跳过
-            continue
+    # 分类报告
+    report_dict = classification_report(y_test, y_pred, output_dict=True)
+    df_report = pd.DataFrame(report_dict).T
+    report_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_classification_report.csv")
+    df_report.to_csv(report_path, encoding="utf-8-sig", index=True)
+    print(f"分类报告已保存：{report_path}")
 
-        age = int(row["年龄"].iloc[0])
-        label = age_to_group(age)
-
-        # ===== 50岁疾病过滤规则 =====
-        has_any_disease = any(has_disease_value(row[c].iloc[0]) for c in disease_cols)
-        has_circulatory = has_disease_value(row["循环系统疾病"].iloc[0]) if "循环系统疾病" in row.columns else False
-
-        if age <= 50:
-            # 必须完全无疾病
-            if has_any_disease:
-                continue
-        else:
-            # 必须有循环系统疾病
-            if not has_circulatory:
-                continue
-
-        # 写入 age/label
-        df["age"] = age
-        df["label"] = label
-
-        # 保留你原来的 data_name top 过滤
-        if TOP_DATA_NAME_PER_DAY is not None:
-            df = filter_top_data_names_per_day(df, top_n=TOP_DATA_NAME_PER_DAY)
-
-        if df.empty:
-            continue
-
-        # 每天取均值（不再随机采样）
-        df_daily = daily_mean_aggregate(df)
-        all_daily.append(df_daily)
-
-    if not all_daily:
-        raise RuntimeError("没有成功读取到任何用户数据，请检查特征路径和用户列表/过滤条件。")
-
-    df_all = pd.concat(all_daily, ignore_index=True)
-
-    print("\n=== 汇总完成（daily mean）===")
-    print("总样本数：", len(df_all))
-    print("总人数：", df_all["user_id"].nunique())
-    print("各类样本数：\n", df_all["label"].value_counts().sort_index())
-
-    # 按人分层划分（不抽样）
-    train_df, test_df = split_by_person_stratified_no_sampling(
-        df_all,
-        user_id_col="user_id",
-        label_col="label",
-        train_person_ratio=0.8,
-        seed=42,
+    # 混淆矩阵
+    disp = ConfusionMatrixDisplay.from_predictions(
+        y_test,
+        y_pred,
+        display_labels=sorted(np.unique(y_train)),
+        cmap=plt.cm.Oranges,
     )
+    plt.title(f"{model_name.upper()} Confusion matrix")
+    cm_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_confusion_matrix_optuna.png")
+    plt.savefig(cm_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"混淆矩阵已保存：{cm_path}")
 
-    print("\n=== 划分完成 ===")
-    print("训练集样本数：", len(train_df), "人数：", train_df["user_id"].nunique())
-    print("测试集样本数：", len(test_df), "人数：", test_df["user_id"].nunique())
+    # 保存模型
+    model_path = os.path.join(SAVE_MODEL_DIR, f"{model_name}_model.pkl")
+    joblib.dump(pipeline, model_path)
+    print(f"模型已保存：{model_path}")
 
-    train_df.to_csv(train_csv_path, index=False, encoding="utf-8-sig")
-    test_df.to_csv(test_csv_path, index=False, encoding="utf-8-sig")
-    print(f"✅ 训练集已保存：{train_csv_path}")
-    print(f"✅ 测试集已保存：{test_csv_path}")
+    return pipeline
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="xgb", choices=["xgb", "svm"])
+    parser.add_argument("--trials", type=int, default=30)
+    parser.add_argument("--tol", type=int, default=2)
+
+    parser.add_argument("--gauss_os", action="store_true", help="开启高斯噪声上采样（仅训练集）")
+    parser.add_argument("--gauss_sigma", type=float, default=0.02)
+    parser.add_argument("--gauss_target", type=str, default="max", help="max 或整数")
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    prepare_and_save_splits()
+    args = parse_args()
+
+    X_train, X_test, y_train, y_test, y_test_age = load_data_from_csv()
+
+    if args.gauss_os:
+        tgt = args.gauss_target
+        if isinstance(tgt, str) and tgt.strip().lower() != "max":
+            tgt = int(tgt)
+        X_train, y_train = gaussian_noise_oversample(
+            X_train, y_train,
+            target=tgt,
+            sigma=args.gauss_sigma,
+            seed=42,
+        )
+
+    train_and_evaluate(
+        model_name=args.model,
+        X_train=X_train,
+        X_test=X_test,
+        y_train=y_train,
+        y_test=y_test,
+        y_test_age=y_test_age,
+        n_trials=args.trials,
+        tol=args.tol,
+    )
