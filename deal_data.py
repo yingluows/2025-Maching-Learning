@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from split import split_by_person_stratified,split_by_person_day_window_stratified
+from split import split_by_person_stratified, split_by_person_day_window_stratified
 
 
 # ========= 路径配置（根据需要修改） =========
@@ -17,11 +17,8 @@ OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 输出的是“原始划分后的数据”，不做特征处理
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_v3.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_v3.csv")
-
-# 每人每天最多保留的样本数
-MAX_PER_DAY_READ = 30
+TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_v7.csv")
+TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_v7.csv")
 
 
 # ========= 通用函数 =========
@@ -61,16 +58,15 @@ def ensure_date_column(df: pd.DataFrame, date_col: str = "_date_for_limit") -> p
     return df
 
 
-def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
+def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 3) -> pd.DataFrame:
     """
     对单个用户的数据：
-      - 先按日期 + data_name 统计 cycle 数量（行数）；
-      - 对每个“日期”，选出 cycle 数最多的前 top_n 个 data_name；
-      - 只保留这些 (日期, data_name) 对应的所有行；
-      - 如果某天 data_name 少于 top_n，则全保留；
-      - 如果某天压根就没记录，自然就“跳过那一天”。
+      - 先按日期 + data_name 统计 cycle 数量（行数）
+      - 对每个“日期”，选出 cycle 数最多的前 top_n 个 data_name
+      - 只保留这些 (日期, data_name) 对应的所有行
+      - 如果某天 data_name 少于 top_n，则全保留
 
-    之后再做按天 max_per_day 采样。
+    注意：这里“不随机、不限量”，保留被选中 data_name 的全部记录。
     """
     if "data_name" not in df.columns or "cycle_number" not in df.columns:
         print("⚠ 警告：数据中不存在 'data_name' 或 'cycle_number' 列，无法按每天前 N 个 data_name 过滤，原样返回。")
@@ -78,19 +74,21 @@ def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFr
 
     df = ensure_date_column(df, date_col="_date_for_limit")
 
-    # 统计每个 (日期, data_name) 的 cycle 数（这里用行数即可）
+    # 统计每个 (日期, data_name) 的 cycle 数（用行数即可）
     group = (
         df.groupby(["_date_for_limit", "data_name"])["cycle_number"]
           .count()
           .reset_index(name="cycle_count")
     )
 
-    # 对每一天，取 cycle_count 最大的前 top_n 个 data_name
-    group_sorted = group.sort_values(["_date_for_limit", "cycle_count"],
-                                     ascending=[True, False])
+    # 每天取 cycle_count 最大的前 top_n 个 data_name
+    group_sorted = group.sort_values(
+        ["_date_for_limit", "cycle_count"],
+        ascending=[True, False]
+    )
     top = group_sorted.groupby("_date_for_limit").head(top_n)
 
-    # 只保留这些 (日期, data_name) 的行
+    # 只保留这些 (日期, data_name) 的行（保留“所有数据”）
     df_filtered = df.merge(
         top[["_date_for_limit", "data_name"]],
         on=["_date_for_limit", "data_name"],
@@ -103,26 +101,6 @@ def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFr
     print("  行数：", len(df_filtered))
 
     return df_filtered
-
-
-def sample_user_by_day(df_user: pd.DataFrame,
-                       max_per_day: int = 20,
-                       seed: int = 42) -> pd.DataFrame:
-    """
-    对单个用户的数据按“日期”分组，每个(人, 日期)最多保留 max_per_day 条记录。
-
-    注意：
-    - 这里假设已经调用过 filter_top_data_names_per_day，
-      因此 df_user 中已经有 "_date_for_limit" 列；
-    - 如果没有，则在这里临时生成一个。
-    """
-    df_user = ensure_date_column(df_user, date_col="_date_for_limit")
-
-    return (
-        df_user.groupby(["user_id", "_date_for_limit"], group_keys=False)
-               .apply(lambda g: g.sample(n=min(len(g), max_per_day), random_state=seed))
-               .reset_index(drop=True)
-    )
 
 
 def load_one_user_file(path: str) -> pd.DataFrame:
@@ -143,7 +121,6 @@ def load_one_user_file(path: str) -> pd.DataFrame:
             "cycle_number", "select_number", "total_select_number"
         ]
         keys = [k for k in cand_keys if k in left.columns and k in right.columns]
-        # 避免重复列
         drop_cols = [c for c in right.columns if c in left.columns and c not in keys]
         right2 = right.drop(columns=drop_cols)
         return left.merge(right2, on=keys, how="left")
@@ -157,6 +134,7 @@ def load_one_user_file(path: str) -> pd.DataFrame:
     base = smart_merge(base, df_freq2)
 
     return base
+
 
 def has_disease_value(x) -> bool:
     """
@@ -194,10 +172,8 @@ def prepare_and_save_splits(
     for path in tqdm(feature_files, desc="正在加载用户特征数据"):
         name = os.path.basename(path)
         if name.startswith("~$"):
-            # 排除 Excel 临时文件
             continue
 
-        # 默认：文件名就是 user_id
         user_id_from_name = os.path.splitext(os.path.basename(path))[0]
 
         # 读特征
@@ -208,7 +184,7 @@ def prepare_and_save_splits(
         else:
             continue
 
-        # 确保有 user_id 列
+        # 确保 user_id
         if "user_id" in df.columns:
             df["user_id"] = df["user_id"].astype(str)
             user_id_in_file = str(df["user_id"].iloc[0])
@@ -227,9 +203,9 @@ def prepare_and_save_splits(
         age = int(row["年龄"].iloc[0])
         label = age_to_group(age)
         df["label"] = label
+        df["age"] = age
 
-        # ========= 新增：按“年龄 × 循环系统疾病”筛选用户 =========
-
+        # ========= 按“年龄 × 疾病”筛选用户 =========
         disease_cols = [
             "某些感染性疾病或寄生虫病",
             "肿瘤",
@@ -245,40 +221,27 @@ def prepare_and_save_splits(
             "肌肉骨骼系统或结缔组织系统疾病",
             "泌尿生殖系统疾病",
         ]
-        
-        # 是否有任意疾病
-        has_any_disease = any(
-            has_disease_value(row[col].iloc[0]) for col in disease_cols
-        )
-        
-        # 是否有循环系统疾病
+
+        has_any_disease = any(has_disease_value(row[col].iloc[0]) for col in disease_cols)
         has_circulatory = has_disease_value(row["循环系统疾病"].iloc[0])
 
-        
-        
-        # ===== 应用你的规则 =====
-        
-        # 1️⃣ 小于等于 40 岁：必须完全无疾病
-        if age <= 40:
+        # 1) <=50：必须完全无疾病
+        if age <= 50:
             if has_any_disease:
                 continue
-        
-        # 2️⃣ 大于 40 岁：必须有循环系统疾病
+        # 2) >50：必须有循环系统疾病
         else:
             if not has_circulatory:
                 continue
 
-        
-        # ========= 先按“每天 cycle 数最多的前 8 个 data_name”过滤 =========
-        df = filter_top_data_names_per_day(df, top_n=8)
+        # ========= 核心修改：每人每天取 cycle_count 最大的前 1 个 data_name，保留其所有数据 =========
+        df = filter_top_data_names_per_day(df, top_n=1)
 
         if df.empty:
             print(f"⚠ 用户 {user_id_from_name} 在该过滤条件下没有任何样本，跳过。")
             continue
 
-        # ========= 然后再按天采样（每天最多 max_per_day 条） =========
-        df = sample_user_by_day(df, max_per_day=MAX_PER_DAY_READ, seed=42)
-
+        # ✅ 不再做按天随机采样，直接保留
         all_df.append(df)
 
     if not all_df:
@@ -290,36 +253,25 @@ def prepare_and_save_splits(
     print("全部数据形状：", df_all.shape)
     print("用户数量：", df_all["user_id"].nunique())
 
-    # === 只做“按人 + 按类”划分，不做任何特征处理 ===
+    # === 只做“按人 + 按类”划分（0.8 人进训练，0.2 人进测试，不改） ===
     train_df, test_df = split_by_person_stratified(
         df_all,
         user_id_col="user_id",
         label_col="label",
-        train_person_ratio=0.8,
+        train_person_ratio=0.8,   # ✅ 按你的要求保持不变
         train_per_class=10000,
-        test_per_class=3000,
+        test_per_class=2000,
         seed=42,
     )
-    #train_df, test_df = split_by_person_day_window_stratified(
-    #    df_all,
-    #    user_id_col="user_id",
-    #    label_col="label",
-    #    date_col="_date_for_limit",
-    #    train_days=5,
-    #    test_days=3,
-    #    train_per_class=6000,
-    #    test_per_class=2000,
-    #    seed=42,
-    #)
 
-    # 删除采样临时列
+    # 删除临时日期列（如果存在）
     for col in ["_date_for_limit"]:
         if col in train_df.columns:
             train_df = train_df.drop(columns=[col])
         if col in test_df.columns:
             test_df = test_df.drop(columns=[col])
 
-    # 原样保存（含所有原始列 + label）
+    # 原样保存
     train_df.to_csv(train_csv_path, index=False, encoding="utf-8-sig")
     test_df.to_csv(test_csv_path, index=False, encoding="utf-8-sig")
 
@@ -329,7 +281,3 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
-
-
-
-
