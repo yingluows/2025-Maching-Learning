@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "01 deal_data",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/deal_data.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "02 select_feature",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/select_feature.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "03 main XGB",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--model", "xgb",
+        "--trials", "20",
+        "--noise_scale", "0.02",
+        "--oversample_target", "max",
+        "--use_tolerance"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "04 main SVM",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--model", "svm",
+        "--trials", "30",
+        "--noise_scale", "0.02",
+        "--oversample_target", "max",
+        "--use_tolerance"
+      ],
+      "justMyCode": true
+    }
+  ]
+}
