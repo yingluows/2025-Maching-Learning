@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from split import split_by_person_stratified,split_by_person_day_window_stratified
+from split import split_by_person_stratified
 
 
 # ========= 路径配置（根据需要修改） =========
@@ -78,7 +78,7 @@ def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFr
 
     df = ensure_date_column(df, date_col="_date_for_limit")
 
-    # 统计每个 (日期, data_name) 的 cycle 数（这里用行数即可）
+    # 统计每个 (日期, data_name) 的 cycle 数
     group = (
         df.groupby(["_date_for_limit", "data_name"])["cycle_number"]
           .count()
@@ -171,7 +171,7 @@ def has_disease_value(x) -> bool:
     return True
 
 
-# ========= 主流程：只负责“过滤 + 按人/按类划分” =========
+# ========= 主流程：过滤 + 按人/按类划分 =========
 
 def prepare_and_save_splits(
     feature_dir: str = FEATURE_DIR,
@@ -253,17 +253,15 @@ def prepare_and_save_splits(
         
         # 是否有循环系统疾病
         has_circulatory = has_disease_value(row["循环系统疾病"].iloc[0])
-
+        has_endocrine = has_disease_value(row["内分泌、营养或代谢疾病"].iloc[0])
+        has_digestive = has_disease_value(row["消化系统疾病"].iloc[0])
         
-        
-        # ===== 应用你的规则 =====
-        
-        # 1️⃣ 小于等于 40 岁：必须完全无疾病
-        if age <= 40:
+        # 1️⃣ 小于等于 50 岁：必须完全无疾病
+        if age <= 50:
             if has_any_disease:
                 continue
         
-        # 2️⃣ 大于 40 岁：必须有循环系统疾病
+        # 2️⃣ 大于 50 岁：必须有循环系统疾病
         else:
             if not has_circulatory:
                 continue
@@ -300,17 +298,7 @@ def prepare_and_save_splits(
         test_per_class=3000,
         seed=42,
     )
-    #train_df, test_df = split_by_person_day_window_stratified(
-    #    df_all,
-    #    user_id_col="user_id",
-    #    label_col="label",
-    #    date_col="_date_for_limit",
-    #    train_days=5,
-    #    test_days=3,
-    #    train_per_class=6000,
-    #    test_per_class=2000,
-    #    seed=42,
-    #)
+    
 
     # 删除采样临时列
     for col in ["_date_for_limit"]:
@@ -329,6 +317,7 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
 
 
 
