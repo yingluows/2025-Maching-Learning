@@ -1,7 +1,6 @@
-# main.py
+# -*- coding: utf-8 -*-
 import os
 import argparse
-import json
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -14,9 +13,10 @@ import joblib
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import classification_report, ConfusionMatrixDisplay, accuracy_score
 from sklearn.svm import SVC
+from sklearn.inspection import permutation_importance
 from xgboost import XGBClassifier
 
 
@@ -24,226 +24,134 @@ from xgboost import XGBClassifier
 matplotlib.rcParams["font.sans-serif"] = ["SimHei"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-# ========= 路径配置 =========
-BASE_DIR = r"D:/2025_Stage/Code/XGB"
 
-DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
-SAVE_FIG_DIR = os.path.join(BASE_DIR, "Save_fig")
-SAVE_MODEL_DIR = os.path.join(BASE_DIR, "Save_model")
-
+# ========= 默认保存路径（相对 main.py 所在目录） =========
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_FIG_DIR = os.path.join(_THIS_DIR, "Save_fig")
+SAVE_MODEL_DIR = os.path.join(_THIS_DIR, "Save_model")
 os.makedirs(SAVE_FIG_DIR, exist_ok=True)
 os.makedirs(SAVE_MODEL_DIR, exist_ok=True)
 
-TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v8.csv")
-TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v8.csv")
+
+# ========= 年龄分箱：20-29, 30-39, ..., 70-79 =========
+# label -> (low, high)，均为闭区间
+LABEL_TO_RANGE = {
+    0: (20, 29),
+    1: (30, 39),
+    2: (40, 49),
+    3: (50, 59),
+    4: (60, 69),
+    5: (70, 79),
+}
+CLASS_NAMES = ["20-29", "30-39", "40-49", "50-59", "60-69", "70-79"]
 
 
-# ========= 年龄段定义（按你的“20岁以下、21-30、以此类推”） =========
-# 默认：<=20, 21-30, 31-40, 41-50, 51-60, >=61
-# 你如果有不同分段，直接改这里即可。
-DEFAULT_AGE_BINS = [
-    (None, 20),   # <=20
-    (21, 30),
-    (31, 40),
-    (41, 50),
-    (51, 60),
-    (61, None),   # >=61
-]
+def age_to_label(age: float) -> int:
+    """把真实年龄映射到 6 个类别（仅允许 20-79）。"""
+    age = int(age)
+    if age < 20 or age > 79:
+        raise ValueError("age_to_label 只接受 20-79 岁（含）范围内的年龄。")
+    return (age - 20) // 10  # 20-29->0 ... 70-79->5
 
 
-# ========= 数据读取 =========
-def load_data_from_csv(train_feat_path: str = TRAIN_FEAT_PATH, test_feat_path: str = TEST_FEAT_PATH):
-    train_df = pd.read_csv(train_feat_path)
-    test_df = pd.read_csv(test_feat_path)
+# ========= 放宽判对：tolerant accuracy（旧策略） =========
+def expanded_range(label: int, tol: int = 2):
+    """给定预测label，返回放宽后的可接受年龄区间 [low, high]（闭区间）。"""
+    low, high = LABEL_TO_RANGE[int(label)]
+    return low - tol, high + tol
 
-    print("特征训练集形状：", train_df.shape)
-    print("特征测试集形状：", test_df.shape)
 
-    X_train = train_df.drop(columns=["label"])
+def tolerant_accuracy(y_pred_label, y_true_age, tol: int = 2) -> float:
+    """
+    判定：真实年龄落在“预测label的放宽区间”内 => 算对
+    y_pred_label: 预测label（0-5）
+    y_true_age:   真实年龄
+    """
+    y_pred_label = np.asarray(y_pred_label).astype(int)
+    y_true_age = np.asarray(y_true_age).astype(float)
+
+    ok = np.zeros_like(y_true_age, dtype=bool)
+    for i, lab in enumerate(y_pred_label):
+        low2, high2 = expanded_range(lab, tol=tol)
+        ok[i] = (low2 <= y_true_age[i] <= high2)
+
+    return float(ok.mean())
+
+
+# ========= 数据读取（训练集/测试集 CSV） =========
+def load_data_from_csv(
+    train_path: str,
+    test_path: str,
+    age_col: str = "年龄",
+    drop_cols_extra=None,
+):
+    """
+    读取训练/测试 CSV，并做以下处理：
+    1) 去掉 20-79 岁以外样本（训练集和测试集都做）
+    2) 根据年龄生成 6 类 label：20-29, 30-39, 40-49, 50-59, 60-69, 70-79
+    3) X 中默认去掉 age_col，以及常见的 user_id（如存在），避免泄露
+    """
+    drop_cols_extra = drop_cols_extra or []
+
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    if age_col not in train_df.columns or age_col not in test_df.columns:
+        raise ValueError(f"CSV 中必须包含真实年龄列 '{age_col}'。")
+
+    # 确保年龄是数值
+    train_df = train_df[pd.to_numeric(train_df[age_col], errors="coerce").notna()].copy()
+    test_df = test_df[pd.to_numeric(test_df[age_col], errors="coerce").notna()].copy()
+    train_df[age_col] = train_df[age_col].astype(int)
+    test_df[age_col] = test_df[age_col].astype(int)
+
+    # 只保留 20-79 岁
+    train_df = train_df[(train_df[age_col] >= 20) & (train_df[age_col] <= 79)].copy()
+    test_df = test_df[(test_df[age_col] >= 20) & (test_df[age_col] <= 79)].copy()
+
+    print("训练集(过滤20-79后)形状：", train_df.shape)
+    print("测试集(过滤20-79后)形状：", test_df.shape)
+
+    # 生成 label
+    train_df["label"] = train_df[age_col].apply(age_to_label).astype(int)
+    test_df["label"] = test_df[age_col].apply(age_to_label).astype(int)
+
+    # y（类别）与 y_age（真实年龄）
     y_train = train_df["label"]
-    X_test = test_df.drop(columns=["label"])
     y_test = test_df["label"]
+    y_train_age = train_df[age_col].astype(float)
+    y_test_age = test_df[age_col].astype(float)
 
+    # X：去掉 label + age + user_id（若存在）+ 额外指定列
+    drop_cols = ["label", age_col] + list(drop_cols_extra)
+    if "user_id" in train_df.columns:
+        drop_cols.append("user_id")
+
+    X_train = train_df.drop(columns=[c for c in drop_cols if c in train_df.columns], errors="ignore")
+    X_test = test_df.drop(columns=[c for c in drop_cols if c in test_df.columns], errors="ignore")
+
+    # inf -> nan
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
     X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
-    return X_train, X_test, y_train, y_test
+    # 打印类别分布（显示为类别名）
+    idx_map = {i: CLASS_NAMES[i] for i in range(6)}
+    print("\n=== 类别分布（训练集）===")
+    print(y_train.value_counts().sort_index().rename(index=idx_map))
+    print("\n=== 类别分布（测试集）===")
+    print(y_test.value_counts().sort_index().rename(index=idx_map))
+
+    return X_train, X_test, y_train, y_test, y_train_age, y_test_age
 
 
-# ========= 高斯噪声上采样 =========
-def gaussian_noise_oversample(
-    X: pd.DataFrame,
-    y: pd.Series,
-    target_strategy: str = "max",   # "max" or "median" or "value"
-    target_value: int = None,
-    noise_scale: float = 0.05,      # 噪声强度：sigma = noise_scale * feature_std
-    random_state: int = 42,
-):
-    """
-    对少数类进行高斯噪声上采样（仅训练集使用）。
-    - 对每个类，用该类样本的数值特征标准差决定噪声规模
-    - 生成新样本：x_new = x + N(0, sigma)
-    """
-    rng = np.random.RandomState(random_state)
-    X = X.copy()
-    y = y.copy()
-
-    num_cols = X.columns
-    Xv = X.values.astype(float)
-
-    counts = y.value_counts()
-    if target_strategy == "max":
-        target_n = int(counts.max())
-    elif target_strategy == "median":
-        target_n = int(counts.median())
-    elif target_strategy == "value":
-        if target_value is None:
-            raise ValueError("target_strategy='value' 时必须提供 target_value")
-        target_n = int(target_value)
-    else:
-        raise ValueError("target_strategy 仅支持: max/median/value")
-
-    new_X_list = [Xv]
-    new_y_list = [y.values]
-
-    for cls, n in counts.items():
-        if n >= target_n:
-            continue
-
-        idx = np.where(y.values == cls)[0]
-        if len(idx) == 0:
-            continue
-
-        need = target_n - n
-
-        base = Xv[idx]
-        std = np.nanstd(base, axis=0)
-        std = np.where(std == 0, 1e-6, std)
-
-        choose_idx = rng.choice(len(base), size=need, replace=True)
-        samples = base[choose_idx]
-
-        noise = rng.normal(loc=0.0, scale=(noise_scale * std), size=samples.shape)
-        synth = samples + noise
-
-        new_X_list.append(synth)
-        new_y_list.append(np.full(need, cls))
-
-    X_new = np.vstack(new_X_list)
-    y_new = np.concatenate(new_y_list)
-
-    X_new = pd.DataFrame(X_new, columns=num_cols)
-    y_new = pd.Series(y_new)
-
-    return X_new, y_new
-
-
-# ========= tolerance：按“真实所在年龄段”扩展 ±tol =========
-def _to_numeric(arr) -> np.ndarray:
-    """把 y 转成 float 数组；不行就抛异常，避免悄悄算错。"""
-    a = np.asarray(arr)
-    try:
-        return a.astype(float)
-    except Exception as e:
-        raise ValueError(
-            "tolerance 需要 label / pred 可转换为数值年龄（例如 18, 25, 42）。"
-            "你现在的 y 可能是类别编号或字符串。"
-        ) from e
-
-
-def _find_bin(age: float, bins) -> tuple[float | None, float | None]:
-    """根据年龄找到所在的 bin（low, high）。low/high 为 None 表示无界。"""
-    for low, high in bins:
-        low_ok = True if low is None else (age >= low)
-        high_ok = True if high is None else (age <= high)
-        if low_ok and high_ok:
-            return low, high
-    # 找不到就当作“单点类”
-    return age, age
-
-
-def tolerant_correct_by_age_bins(y_true, y_pred, bins, tol: int = 2) -> np.ndarray:
-    """
-    对每个样本：
-      1) 先用 y_true 找到其所属年龄段 (low, high)
-      2) 把该年龄段扩展为 (low - tol, high + tol)（无界端保持无界）
-      3) 若 y_pred 落在扩展区间内，则算对
-    """
-    yt = _to_numeric(y_true)
-    yp = _to_numeric(y_pred)
-
-    ok = np.zeros_like(yt, dtype=bool)
-    for i in range(len(yt)):
-        low, high = _find_bin(float(yt[i]), bins)
-
-        # 扩展 ±tol；无界端保持无界
-        low2 = None if low is None else (float(low) - tol)
-        high2 = None if high is None else (float(high) + tol)
-
-        pred = float(yp[i])
-        low_ok = True if low2 is None else (pred >= low2)
-        high_ok = True if high2 is None else (pred <= high2)
-        ok[i] = low_ok and high_ok
-
-    return ok
-
-
-def tolerant_accuracy_by_age_bins(y_true, y_pred, bins, tol: int = 2) -> float:
-    ok = tolerant_correct_by_age_bins(y_true, y_pred, bins=bins, tol=tol)
-    return float(np.mean(ok)) if len(ok) else 0.0
-
-
-# ========= 模型构造 =========
-def build_pipeline(model_name: str, params: dict):
+# ========= Optuna 目标函数 =========
+def create_objective(model_name: str, X_train, y_train):
     model_name = model_name.lower()
-
-    if model_name == "xgb":
-        clf = XGBClassifier(
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            n_jobs=-1,
-            random_state=42,
-            **params,
-        )
-        pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="mean")),
-            ("clf", clf),
-        ])
-        return pipeline
-
-    if model_name == "svm":
-        clf = SVC(
-            probability=True,
-            decision_function_shape="ovr",
-            random_state=42,
-            **params,
-        )
-        pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", StandardScaler()),
-            ("clf", clf),
-        ])
-        return pipeline
-
-    raise ValueError("model 仅支持 xgb 或 svm")
-
-
-# ========= Optuna 目标函数（带 CV + 训练折上采样） =========
-def create_objective(
-    model_name: str,
-    X: pd.DataFrame,
-    y: pd.Series,
-    cv_splits: int = 5,
-    oversample_noise_scale: float = 0.05,
-    oversample_target: str = "max",
-):
-    model_name = model_name.lower()
-    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
 
     def objective(trial):
         if model_name == "xgb":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500),
                 "max_depth": trial.suggest_int("max_depth", 3, 10),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
                 "subsample": trial.suggest_float("subsample", 0.6, 1.0),
@@ -253,232 +161,348 @@ def create_objective(
                 "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
             }
-        else:
+
+            clf = XGBClassifier(
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                num_class=6,
+                n_jobs=-1,
+                random_state=42,
+                tree_method="hist",
+                **params,
+            )
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("clf", clf),
+            ])
+
+        elif model_name == "svm":
             kernel = trial.suggest_categorical("kernel", ["rbf", "linear", "poly", "sigmoid"])
             C = trial.suggest_float("C", 1e-2, 1e2, log=True)
+
             params = {"kernel": kernel, "C": C}
+
             if kernel in ("rbf", "poly", "sigmoid"):
                 params["gamma"] = trial.suggest_float("gamma", 1e-4, 1e0, log=True)
             if kernel == "poly":
                 params["degree"] = trial.suggest_int("degree", 2, 5)
 
-        scores = []
-        for tr_idx, va_idx in skf.split(X, y):
-            X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-            X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
-
-            # 只在训练折上做高斯噪声上采样（避免泄露）
-            X_tr_os, y_tr_os = gaussian_noise_oversample(
-                X_tr, y_tr,
-                target_strategy=oversample_target,
-                noise_scale=oversample_noise_scale,
+            clf = SVC(
+                probability=True,
+                decision_function_shape="ovr",
                 random_state=42,
+                **params,
             )
 
-            pipe = build_pipeline(model_name, params)
-            pipe.fit(X_tr_os, y_tr_os)
-            pred = pipe.predict(X_va)
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("scaler", StandardScaler()),
+                ("clf", clf),
+            ])
+        else:
+            raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
-            # Optuna 仍用“严格准确率”做优化（不污染调参）
-            acc = float(np.mean(pred == y_va.values))
-            scores.append(acc)
-
-        return float(np.mean(scores))
+        score = cross_val_score(
+            pipeline, X_train, y_train,
+            cv=5,
+            scoring="accuracy"
+        ).mean()
+        return score
 
     return objective
+
+
+def save_permutation_importance(
+    pipe,
+    X,
+    y,
+    feature_names,
+    out_csv,
+    n_repeats=10,
+    random_state=42,
+    scoring="f1_macro"
+):
+    """
+    适用于 SVM / 任意模型的特征重要性（模型无关、推荐）
+    """
+    result = permutation_importance(
+        pipe,
+        X,
+        y,
+        n_repeats=n_repeats,
+        random_state=random_state,
+        scoring=scoring,
+        n_jobs=-1
+    )
+
+    df = pd.DataFrame({
+        "feature": feature_names,
+        "importance_mean": result.importances_mean,
+        "importance_std": result.importances_std,
+    }).sort_values("importance_mean", ascending=False)
+
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"✅ Permutation importance 已保存到: {out_csv}")
+
+
+def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
+    model_name = model_name.lower()
+
+    # 抽样，避免太慢
+    sample_X_df = X_test.sample(n=min(200, len(X_test)), random_state=42)
+    feature_names = sample_X_df.columns.tolist()
+
+    if model_name == "xgb":
+        # 这里用 shap.Explainer + predict_proba，兼容性最好
+        explainer = shap.Explainer(pipeline.predict_proba, sample_X_df)
+        shap_values = explainer(sample_X_df)
+        values = shap_values.values  # (n, p, K) 或 (n, p)
+
+        # 多分类聚合：按类取绝对值平均 -> (n,p)
+        if values.ndim == 3:
+            values_agg = np.mean(values, axis=2)
+            importance = np.mean(np.abs(values), axis=(0, 2))
+        else:
+            values_agg = values
+            importance = np.mean(np.abs(values), axis=0)
+
+        # dot
+        plt.figure()
+        shap.summary_plot(values_agg, sample_X_df, show=False)
+        plt.title(f"{model_name.upper()} SHAP Summary (Dot)")
+        shap_dot_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_dot.png")
+        plt.savefig(shap_dot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"SHAP dot 图已保存到: {shap_dot_path}")
+
+        # bar
+        plt.figure()
+        shap.summary_plot(values_agg, sample_X_df, plot_type="bar", show=False)
+        plt.title(f"{model_name.upper()} SHAP Summary (Bar)")
+        shap_bar_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_bar.png")
+        plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"SHAP bar 图已保存到: {shap_bar_path}")
+
+        importance_all = pd.DataFrame({
+            "feature": feature_names,
+            "importance": importance,
+        }).sort_values(by="importance", ascending=False)
+
+        print("\n=== 前 20 特征（SHAP） ===")
+        print(importance_all.head(20))
+
+        importance_csv_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_feature_importance.csv")
+        importance_all.to_csv(importance_csv_path, index=False, encoding="utf-8-sig")
+        print(f"所有 SHAP 特征重要性已保存到：{importance_csv_path}")
+        return
+
+    elif model_name == "svm":
+        # ✅ 关键修复：KernelExplainer 用 numpy + lambda，避免触发 Pipeline.feature_names_in_ 的 setter 问题
+        sample_X = sample_X_df.to_numpy()
+        background_df = sample_X_df.sample(n=min(50, len(sample_X_df)), random_state=42)
+        background = background_df.to_numpy()
+
+        f = lambda x: pipeline.predict_proba(x)  # 不要直接传 pipeline/predict_proba 引用给 SHAP 的某些包装路径
+        explainer = shap.KernelExplainer(f, background)
+
+        shap_values = explainer.shap_values(sample_X, nsamples=100)
+
+        # 多分类：list[K] each (n, p) -> (n,p,K)
+        if isinstance(shap_values, list):
+            values = np.stack(shap_values, axis=-1)
+        else:
+            values = np.array(shap_values)
+
+        # 聚合
+        if values.ndim == 3:
+            values_agg = np.mean(values, axis=2)         # (n,p)
+            importance = np.mean(np.abs(values), axis=(0, 2))
+        else:
+            values_agg = values
+            importance = np.mean(np.abs(values), axis=0)
+
+        # dot（这里 features 用 numpy，并显式传 feature_names）
+        plt.figure()
+        shap.summary_plot(values_agg, sample_X, feature_names=feature_names, show=False)
+        plt.title(f"{model_name.upper()} SHAP Summary (Dot)")
+        shap_dot_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_dot.png")
+        plt.savefig(shap_dot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"SHAP dot 图已保存到: {shap_dot_path}")
+
+        # bar
+        plt.figure()
+        shap.summary_plot(values_agg, sample_X, feature_names=feature_names, plot_type="bar", show=False)
+        plt.title(f"{model_name.upper()} SHAP Summary (Bar)")
+        shap_bar_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_bar.png")
+        plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"SHAP bar 图已保存到: {shap_bar_path}")
+
+        importance_all = pd.DataFrame({
+            "feature": feature_names,
+            "importance": importance,
+        }).sort_values(by="importance", ascending=False)
+
+        print("\n=== 前 20 特征（SHAP） ===")
+        print(importance_all.head(20))
+
+        importance_csv_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_feature_importance.csv")
+        importance_all.to_csv(importance_csv_path, index=False, encoding="utf-8-sig")
+        print(f"所有 SHAP 特征重要性已保存到：{importance_csv_path}")
+        return
+
+    else:
+        raise ValueError(f"不支持的 model: {model_name}")
+
 
 
 # ========= 训练 / 评估 =========
 def train_and_evaluate(
     model_name: str,
-    X_train: pd.DataFrame,
-    X_test: pd.DataFrame,
-    y_train: pd.Series,
-    y_test: pd.Series,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    y_test_age=None,
     n_trials: int = 30,
     run_shap_flag: bool = True,
-    oversample_noise_scale: float = 0.05,
-    oversample_target: str = "max",
-    use_tolerance: bool = False,
     tol: int = 2,
-    age_bins=None,
 ):
     model_name = model_name.lower()
-    age_bins = age_bins or DEFAULT_AGE_BINS
 
-    # Optuna 调参（CV 内部训练折上采样）
+    # Optuna 调参
     study = optuna.create_study(direction="maximize")
-    study.optimize(
-        create_objective(
-            model_name=model_name,
-            X=X_train,
-            y=y_train,
-            cv_splits=5,
-            oversample_noise_scale=oversample_noise_scale,
-            oversample_target=oversample_target,
-        ),
-        n_trials=n_trials,
-    )
+    study.optimize(create_objective(model_name, X_train, y_train), n_trials=n_trials)
 
     print("最优参数：", study.best_params)
-    print("最优 CV 严格准确率：", study.best_value)
+    print("最优交叉验证准确率：", study.best_value)
 
     best_params = study.best_params.copy()
 
-    # 最终训练：对整个训练集做一次上采样，再 fit
-    X_train_os, y_train_os = gaussian_noise_oversample(
-        X_train, y_train,
-        target_strategy=oversample_target,
-        noise_scale=oversample_noise_scale,
-        random_state=42,
-    )
+    if model_name == "xgb":
+        clf_best = XGBClassifier(
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            num_class=6,
+            n_jobs=-1,
+            random_state=42,
+            tree_method="hist",
+            **best_params,
+        )
+        pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="mean")),
+            ("clf", clf_best),
+        ])
 
-    pipeline = build_pipeline(model_name, best_params)
-    pipeline.fit(X_train_os, y_train_os)
+    elif model_name == "svm":
+        clf_best = SVC(
+            probability=True,
+            decision_function_shape="ovr",
+            random_state=42,
+            **best_params,
+        )
+        pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="mean")),
+            ("scaler", StandardScaler()),
+            ("clf", clf_best),
+        ])
+    else:
+        raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
+    pipeline.fit(X_train, y_train)
     y_pred = pipeline.predict(X_test)
 
-    # ===== 严格评估（原有报告） =====
-    report_dict = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-    df_report = pd.DataFrame(report_dict).T
-    report_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_classification_report_strict.csv")
-    df_report.to_csv(report_path, encoding="utf-8-sig")
-    print(f"严格分类报告已保存到: {report_path}")
+    # ====== SVM 特征重要性（Permutation Importance）======
+    if model_name == "svm":
+        pi_csv = os.path.join(SAVE_FIG_DIR, "svm_permutation_importance.csv")
+        save_permutation_importance(
+            pipe=pipeline,
+            X=X_test,
+            y=y_test,
+            feature_names=X_test.columns.tolist(),
+            out_csv=pi_csv,
+            scoring="f1_macro"
+        )
 
-    # ===== tolerance 评估（按年龄段扩展 ±tol） =====
-    if use_tolerance:
-        tol_acc = tolerant_accuracy_by_age_bins(y_test.values, y_pred, bins=age_bins, tol=tol)
-        tol_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_tolerance_score.txt")
+    # ====== 普通 accuracy ======
+    acc = accuracy_score(y_test, y_pred)
+    print(f"\n✅ 普通 Accuracy: {acc:.4f}")
+
+    # ====== 放宽判对 tolerant accuracy ======
+    if y_test_age is not None:
+        tacc = tolerant_accuracy(y_pred_label=y_pred, y_true_age=y_test_age.values, tol=tol)
+        print(f"✅ Tolerant Accuracy (±{tol}岁): {tacc:.4f}")
+
+        tol_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_tolerant_accuracy.txt")
         with open(tol_path, "w", encoding="utf-8") as f:
-            f.write(f"tolerance_accuracy={tol_acc:.6f}\n")
-            f.write(f"tol=±{tol}\n")
-            f.write(f"age_bins={age_bins}\n")
-        print(f"tolerance 准确率（按年龄段±{tol}岁）：{tol_acc:.6f} （已保存：{tol_path}）")
+            f.write(f"accuracy={acc:.6f}\n")
+            f.write(f"tolerant_accuracy_tol_{tol}={tacc:.6f}\n")
+        print(f"放宽判对指标已保存到: {tol_path}")
 
-    # ===== 归一化混淆矩阵（按真实类别：行归一化）=====
-    disp = ConfusionMatrixDisplay.from_estimator(
-        pipeline, X_test, y_test,
-        display_labels=sorted(pd.unique(y_train)),
-        normalize="true",
-        cmap=plt.cm.Oranges,
-        values_format=".2f",
+    # 分类报告（带类别名）
+    report_dict = classification_report(
+        y_test, y_pred,
+        labels=list(range(6)),
+        target_names=CLASS_NAMES,
+        output_dict=True,
+        zero_division=0,
     )
+    df_report = pd.DataFrame(report_dict).T
+    report_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_classification_report.csv")
+    df_report.to_csv(report_path, encoding="utf-8-sig", index=True)
+    print(f"分类报告已保存到: {report_path}")
 
-    plt.title(f"{model_name.upper()} Confusion matrix (normalized by true)")
-    cm_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_confusion_matrix_optuna_norm_true.png")
-    plt.savefig(cm_path, dpi=300, bbox_inches="tight")
+    # 混淆矩阵
+    ConfusionMatrixDisplay.from_estimator(
+        pipeline, X_test, y_test,
+        display_labels=CLASS_NAMES,
+        cmap=plt.cm.Blues,
+    )
+    plt.title(f"{model_name.upper()} Confusion matrix")
+    cm_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_confusion_matrix_optuna.png")
     plt.tight_layout()
-    plt.show()
-    print(f"归一化混淆矩阵已保存到: {cm_path}")
+    plt.savefig(cm_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"混淆矩阵已保存到: {cm_path}")
 
     # 保存模型
     model_path = os.path.join(SAVE_MODEL_DIR, f"{model_name}_model.pkl")
     joblib.dump(pipeline, model_path)
     print(f"模型已保存到: {model_path}")
 
-    # SHAP
+    # SHAP 模型解释
     if run_shap_flag:
         run_shap(model_name, pipeline, X_test)
 
     return pipeline
 
 
-def run_shap(model_name: str, pipeline, X_test: pd.DataFrame):
-    model_name = model_name.lower()
-    sample_X = X_test.sample(n=min(200, len(X_test)), random_state=42)
-
-    if model_name == "xgb":
-        explainer = shap.Explainer(pipeline.predict, sample_X)
-        shap_values = explainer(sample_X)
-        values = shap_values.values
-
-    elif model_name == "svm":
-        background = sample_X.sample(n=min(50, len(sample_X)), random_state=42)
-        explainer = shap.KernelExplainer(pipeline.predict_proba, background)
-        shap_values = explainer.shap_values(sample_X, nsamples=100)
-
-        if isinstance(shap_values, list):
-            values = np.stack(shap_values, axis=-1)
-        else:
-            values = np.array(shap_values)
-    else:
-        raise ValueError(f"不支持的 model: {model_name}")
-
-    if values.ndim == 3:
-        values_agg = np.mean(np.abs(values), axis=2) * np.sign(np.mean(values, axis=2))
-        importance = np.mean(np.abs(values), axis=(0, 2))
-    else:
-        values_agg = values
-        importance = np.mean(np.abs(values), axis=0)
-
-    plt.figure()
-    shap.summary_plot(values_agg, sample_X, show=False)
-    plt.title(f"{model_name.upper()} SHAP Summary (Dot)")
-    shap_dot_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_dot.png")
-    plt.savefig(shap_dot_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"SHAP dot 图已保存到: {shap_dot_path}")
-
-    plt.figure()
-    shap.summary_plot(values_agg, sample_X, plot_type="bar", show=False)
-    plt.title(f"{model_name.upper()} SHAP Summary (Bar)")
-    shap_bar_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_summary_bar.png")
-    plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"SHAP bar 图已保存到: {shap_bar_path}")
-
-    importance_all = pd.DataFrame({
-        "feature": sample_X.columns,
-        "importance": importance,
-    }).sort_values(by="importance", ascending=False)
-
-    importance_csv_path = os.path.join(SAVE_FIG_DIR, f"{model_name}_shap_feature_importance.csv")
-    importance_all.to_csv(importance_csv_path, index=False, encoding="utf-8-sig")
-    print(f"所有特征重要性排名已保存到：{importance_csv_path}")
-
-
-def parse_age_bins(s: str):
-    """
-    支持传 JSON，例如：
-      --age_bins '[[null,20],[21,30],[31,40],[41,50],[51,60],[61,null]]'
-    其中 null 表示无界。
-    """
-    if not s:
-        return None
-    bins = json.loads(s)
-    out = []
-    for low, high in bins:
-        out.append((low, high))
-    return out
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="xgb", choices=["xgb", "svm"])
-    parser.add_argument("--trials", type=int, default=30)
-    parser.add_argument("--no_shap", action="store_true")
-    parser.add_argument("--noise_scale", type=float, default=0.05, help="高斯噪声强度：sigma = noise_scale * std")
-    parser.add_argument("--oversample_target", type=str, default="max", choices=["max", "median"])
+    parser.add_argument("--model", type=str, default="xgb", choices=["xgb", "svm"], help="选择模型：xgb 或 svm")
+    parser.add_argument("--trials", type=int, default=30, help="Optuna 迭代次数")
+    parser.add_argument("--no_shap", action="store_true", help="不运行 SHAP（SVM 会更快）")
+    parser.add_argument("--tol", type=int, default=2, help="放宽判对的年龄容忍度（±tol岁），默认 2")
 
-    # tolerance（按年龄段扩展 ±tol）
-    parser.add_argument("--use_tolerance", action="store_true", help="启用 tolerance 评估（按年龄段扩展 ±tol 岁）")
-    parser.add_argument("--tol", type=int, default=2, help="tolerance 年龄扩展：±tol（默认 2）")
-    parser.add_argument(
-        "--age_bins",
-        type=str,
-        default="",
-        help="可选：自定义年龄段 JSON，例如 '[[null,20],[21,30],[31,40],[61,null]]'，null 表示无界"
-    )
-
+    parser.add_argument("--train_csv", type=str, default=os.path.join(_THIS_DIR, "训练集_修正版.csv"),
+                        help="训练集 CSV 路径（默认同目录下：训练集_修正版.csv）")
+    parser.add_argument("--test_csv", type=str, default=os.path.join(_THIS_DIR, "测试集_修正版.csv"),
+                        help="测试集 CSV 路径（默认同目录下：测试集_修正版.csv）")
+    parser.add_argument("--age_col", type=str, default="年龄", help="CSV 中真实年龄列名，默认：年龄")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    X_train, X_test, y_train, y_test = load_data_from_csv()
-
-    bins = parse_age_bins(args.age_bins) or DEFAULT_AGE_BINS
+    X_train, X_test, y_train, y_test, y_train_age, y_test_age = load_data_from_csv(
+        train_path=args.train_csv,
+        test_path=args.test_csv,
+        age_col=args.age_col,
+    )
 
     train_and_evaluate(
         model_name=args.model,
@@ -486,11 +510,8 @@ if __name__ == "__main__":
         X_test=X_test,
         y_train=y_train,
         y_test=y_test,
+        y_test_age=y_test_age,
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
-        oversample_noise_scale=args.noise_scale,
-        oversample_target=args.oversample_target,
-        use_tolerance=args.use_tolerance,
         tol=args.tol,
-        age_bins=bins,
     )
