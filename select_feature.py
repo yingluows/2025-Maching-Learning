@@ -11,12 +11,12 @@ DATA_SPLIT_DIR = os.path.join(BASE_DIR, "Data_splits")
 os.makedirs(DATA_SPLIT_DIR, exist_ok=True)
 
 # deal_data 输出
-TRAIN_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "train_raw.csv")
-TEST_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "test_raw.csv")
+TRAIN_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "train_raw_v3.csv")
+TEST_RAW_PATH = os.path.join(DATA_SPLIT_DIR, "test_raw_v3.csv")
 
 # 本文件输出
-TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v1.csv")
-TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v1.csv")
+TRAIN_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "train_v3.csv")
+TEST_FEAT_PATH = os.path.join(DATA_SPLIT_DIR, "test_v3.csv")
 
 # ========= 皮尔逊结果配置 =========
 PEARSON_DIR = BASE_DIR
@@ -109,7 +109,7 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
     - 删除非特征列与 user_id
     """
     drop_not_features = [
-        "user_id",        # 按你要求：这里要删 user_id
+        "user_id",        # 这里要删 user_id
         "data_name",
         "group_id",
         "person_day",
@@ -150,7 +150,7 @@ def deal_file(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
         print(f"[deal_file] 初步处理后特征数：{X.shape[1]}")
 
-        # 7) 皮尔逊筛选（与原策略一致）
+        # 7) 皮尔逊筛选
         if HIGH_CORR_FEATURES:
             keep_cols = []
             for col in X.columns:
