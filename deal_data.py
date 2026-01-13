@@ -6,19 +6,19 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from split import split_by_person_stratified,split_by_person_day_window_stratified
+from split import split_by_person_stratified
 
 
 # ========= 路径配置（根据需要修改） =========
 FEATURE_DIR = r"D:/2025_Stage/Code/XGB/ppgfeature_v114"
-USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户列表.csv"
+USER_INFO_PATH = r"D:/2025_Stage/Code/XGB/用户疾病分类统计.csv"
 
 OUTPUT_DIR = r"D:/2025_Stage/Code/XGB/Data_splits"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 输出的是“原始划分后的数据”，不做特征处理
-TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw.csv")
-TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw.csv")
+TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_raw_v3.csv")
+TEST_CSV_PATH = os.path.join(OUTPUT_DIR, "test_raw_v3.csv")
 
 # 每人每天最多保留的样本数
 MAX_PER_DAY_READ = 30
@@ -78,7 +78,7 @@ def filter_top_data_names_per_day(df: pd.DataFrame, top_n: int = 8) -> pd.DataFr
 
     df = ensure_date_column(df, date_col="_date_for_limit")
 
-    # 统计每个 (日期, data_name) 的 cycle 数（这里用行数即可）
+    # 统计每个 (日期, data_name) 的 cycle 数
     group = (
         df.groupby(["_date_for_limit", "data_name"])["cycle_number"]
           .count()
@@ -158,8 +158,20 @@ def load_one_user_file(path: str) -> pd.DataFrame:
 
     return base
 
+def has_disease_value(x) -> bool:
+    """
+    判断一个疾病单元格是否表示“有疾病”
+    兼容：0/1、是/否、有/无、文本、NaN
+    """
+    if pd.isna(x):
+        return False
+    x = str(x).strip()
+    if x in ("0", "无", "否", "", "nan", "NaN"):
+        return False
+    return True
 
-# ========= 主流程：只负责“过滤 + 按人/按类划分” =========
+
+# ========= 主流程：过滤 + 按人/按类划分 =========
 
 def prepare_and_save_splits(
     feature_dir: str = FEATURE_DIR,
@@ -216,7 +228,46 @@ def prepare_and_save_splits(
         label = age_to_group(age)
         df["label"] = label
 
-        # ========= 新增：先按“每天 cycle 数最多的前 8 个 data_name”过滤 =========
+        # ========= 新增：按“年龄 × 循环系统疾病”筛选用户 =========
+
+        disease_cols = [
+            "某些感染性疾病或寄生虫病",
+            "肿瘤",
+            "血液或造血器官疾病",
+            "免疫系统疾病",
+            "内分泌、营养或代谢疾病",
+            "精神、行为或神经发育障碍",
+            "睡眠-觉醒障碍",
+            "精神系统疾病",
+            "循环系统疾病",
+            "呼吸系统疾病",
+            "消化系统疾病",
+            "肌肉骨骼系统或结缔组织系统疾病",
+            "泌尿生殖系统疾病",
+        ]
+        
+        # 是否有任意疾病
+        has_any_disease = any(
+            has_disease_value(row[col].iloc[0]) for col in disease_cols
+        )
+        
+        # 是否有循环系统疾病
+        has_circulatory = has_disease_value(row["循环系统疾病"].iloc[0])
+        has_endocrine = has_disease_value(row["内分泌、营养或代谢疾病"].iloc[0])
+        has_digestive = has_disease_value(row["消化系统疾病"].iloc[0])
+        
+        # 1️⃣ 小于等于 50 岁：必须完全无疾病
+        if age <= 50:
+            if has_any_disease:
+                continue
+        
+        # 2️⃣ 大于 50 岁：必须有循环系统疾病
+        else:
+            if not has_circulatory:
+                continue
+
+        
+        # ========= 先按“每天 cycle 数最多的前 8 个 data_name”过滤 =========
         df = filter_top_data_names_per_day(df, top_n=8)
 
         if df.empty:
@@ -238,26 +289,16 @@ def prepare_and_save_splits(
     print("用户数量：", df_all["user_id"].nunique())
 
     # === 只做“按人 + 按类”划分，不做任何特征处理 ===
-    #train_df, test_df = split_by_person_stratified(
-    #    df_all,
-    #    user_id_col="user_id",
-    #    label_col="label",
-    #    train_person_ratio=0.8,
-    #    train_per_class=10000,
-    #    test_per_class=3000,
-    #    seed=42,
-    #)
-    train_df, test_df = split_by_person_day_window_stratified(
+    train_df, test_df = split_by_person_stratified(
         df_all,
         user_id_col="user_id",
         label_col="label",
-        date_col="_date_for_limit",
-        train_days=5,
-        test_days=3,
-        train_per_class=6000,
-        test_per_class=2000,
+        train_person_ratio=0.8,
+        train_per_class=10000,
+        test_per_class=3000,
         seed=42,
     )
+    
 
     # 删除采样临时列
     for col in ["_date_for_limit"]:
@@ -276,5 +317,8 @@ def prepare_and_save_splits(
 
 if __name__ == "__main__":
     prepare_and_save_splits()
+
+
+
 
 

@@ -90,7 +90,6 @@ def split_by_person_day_window_stratified(
         )
 
     # 统一日期格式，确保可排序
-    # 允许 date_col 是 'YYYY-MM-DD' 字符串或 datetime
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
     train_parts = []
@@ -144,4 +143,3 @@ def split_by_person_day_window_stratified(
     print("测试集各类样本数:\n", test_final[label_col].value_counts().sort_index())
 
     return train_final, test_final
-
