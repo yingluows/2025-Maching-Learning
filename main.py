@@ -9,13 +9,17 @@ import pandas as pd
 import shap
 import joblib
 
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import classification_report, ConfusionMatrixDisplay
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
+
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.base import BaseSampler
+from sklearn.utils import check_random_state
+
 
 
 # ========= Matplotlib 中文设置 =========
@@ -65,6 +69,63 @@ def load_data_from_csv(
 
     return X_train, X_test, y_train, y_test
 
+class GaussianNoiseOverSampler(BaseSampler):
+    """
+    把每个类别上采样到与多数类相同的数量，并对“新增的复制样本”添加高斯噪声。
+    - 只对数值特征加噪（你在 select_feature.py 最终保留的是数值特征，这里适配） :contentReference[oaicite:1]{index=1}
+    - 噪声强度按每个特征的 std * noise_scale
+    """
+    _sampling_type = "over-sampling"
+
+    def __init__(self, noise_scale=0.01, sampling_strategy="auto", random_state=42, clip=None):
+        super().__init__(sampling_strategy=sampling_strategy)
+        self.noise_scale = float(noise_scale)
+        self.random_state = random_state
+        self.clip = clip  # 可选：如 (-5, 5) 限制扰动后的值
+
+    def _fit_resample(self, X, y):
+        rng = check_random_state(self.random_state)
+
+        # 转 numpy
+        X_np = X.to_numpy() if hasattr(X, "to_numpy") else X
+        y_np = y.to_numpy() if hasattr(y, "to_numpy") else y
+
+        classes, counts = np.unique(y_np, return_counts=True)
+        max_count = counts.max()
+
+        # 每列 std，用于设置噪声尺度
+        col_std = np.std(X_np, axis=0, ddof=0)
+        col_std[col_std == 0] = 1.0  # 防止全0列
+
+        X_out = [X_np]
+        y_out = [y_np]
+
+        for c, n in zip(classes, counts):
+            n_add = max_count - n
+            if n_add <= 0:
+                continue
+
+            idx_c = np.flatnonzero(y_np == c)
+            # 从该类中有放回抽样
+            pick = rng.choice(idx_c, size=n_add, replace=True)
+            X_new = X_np[pick].copy()
+
+            # 只对新增样本加噪声
+            noise = rng.normal(loc=0.0, scale=col_std * self.noise_scale, size=X_new.shape)
+            X_new = X_new + noise
+
+            if self.clip is not None:
+                lo, hi = self.clip
+                X_new = np.clip(X_new, lo, hi)
+
+            X_out.append(X_new)
+            y_out.append(np.full(n_add, c))
+
+        X_res = np.vstack(X_out)
+        y_res = np.concatenate(y_out)
+
+        return X_res, y_res
+
 
 # ========= Optuna 目标函数 =========
 
@@ -93,10 +154,12 @@ def create_objective(model_name: str, X_train, y_train):
                 **params,
             )
 
-            pipeline = Pipeline([
+            pipeline = ImbPipeline([
                 ("imputer", SimpleImputer(strategy="mean")),
+                ("upsample", GaussianNoiseOverSampler(noise_scale=0.02, random_state=42)),
                 ("clf", clf),
             ])
+
 
         elif model_name == "svm":
             # SVM 对尺度敏感：必须标准化
@@ -117,11 +180,13 @@ def create_objective(model_name: str, X_train, y_train):
                 **params,
             )
 
-            pipeline = Pipeline([
+            pipeline = ImbPipeline(steps=[
                 ("imputer", SimpleImputer(strategy="mean")),
-                ("scaler", StandardScaler()),
+                ("scaler", StandardScaler()),                 # SVM 必须标准化
+                ("upsample", GaussianNoiseOverSampler(noise_scale=0.02, random_state=42)),
                 ("clf", clf),
             ])
+
         else:
             raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
@@ -157,10 +222,13 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
             random_state=42,
             **best_params,
         )
-        pipeline = Pipeline([
+        pipeline = ImbPipeline([
             ("imputer", SimpleImputer(strategy="mean")),
+            ("upsample", GaussianNoiseOverSampler(noise_scale=0.02, random_state=42)),
             ("clf", clf_best),
         ])
+
+
 
     elif model_name == "svm":
         clf_best = SVC(
@@ -169,11 +237,13 @@ def train_and_evaluate(model_name: str, X_train, X_test, y_train, y_test, n_tria
             random_state=42,
             **best_params,
         )
-        pipeline = Pipeline([
+        pipeline = ImbPipeline(steps=[
             ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", StandardScaler()),
+            ("scaler", StandardScaler()),                 # SVM 必须标准化
+            ("upsample", GaussianNoiseOverSampler(noise_scale=0.02, random_state=42)),
             ("clf", clf_best),
         ])
+
     else:
         raise ValueError(f"不支持的 model: {model_name}，请选择 xgb 或 svm")
 
@@ -305,3 +375,6 @@ if __name__ == "__main__":
         n_trials=args.trials,
         run_shap_flag=(not args.no_shap),
     )
+
+
+
